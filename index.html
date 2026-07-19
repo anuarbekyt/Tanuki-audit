@@ -1,0 +1,2762 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)">
+<title>TanukiFamily • Аудит качества</title>
+<link rel="manifest" href="manifest.json">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: { extend: {
+    colors: { brand: { DEFAULT: '#EA1B24', 600: '#C2151F', 700: '#A11017' } },
+    fontFamily: { sans: ['Inter', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'] },
+    borderRadius: { '2xl': '1rem', '3xl': '1.375rem' }
+  } }
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/html2pdf.js@0.10.2/dist/html2pdf.bundle.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+<style>
+  :root { color-scheme: light dark; }
+  html { -webkit-tap-highlight-color: transparent; }
+  body { font-feature-settings: "cv02","cv03","cv04","cv11"; text-rendering: optimizeLegibility; }
+  /* Visible keyboard focus, hidden for pointer users */
+  :focus-visible { outline: 2px solid #EA1B24; outline-offset: 2px; border-radius: 8px; }
+  button:focus:not(:focus-visible) { outline: none; }
+  .tnk-press { transition: transform .12s ease, background-color .15s ease, border-color .15s ease; }
+  .tnk-tile:active, .tnk-key:active { transform: scale(.97); }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+    .tnk-tile:active, .tnk-key:active { transform: none; }
+  }
+</style>
+</head>
+<body class="bg-[#F7F8FA] dark:bg-[#0B1120] text-slate-900 dark:text-slate-100 font-sans antialiased">
+<div id="app"></div>
+
+<!-- ============================================================
+     STEP 1 — DATA LAYER: config, IndexedDB schema, seed data
+     ============================================================ -->
+<script id="app-config">
+"use strict";
+
+/* Global application configuration */
+const APP_CONFIG = {
+  appName: "TanukiFamily Audit",
+  version: "0.1.0",
+  // Google Apps Script Web App URL — filled after backend deploy (Step 2)
+  apiUrl: "https://script.google.com/macros/s/AKfycbw9tNUWHSVbHVNXyDdSJ6hN74HlbabeJDSyMmPL-88lcn_46aPPXEbKvODgs7fNxw/exec",
+  db: { name: "tanuki_audit", version: 5 }
+};
+
+/* ---------- IndexedDB schema: stores, keyPath, indexes ---------- */
+const DB_SCHEMA = {
+  users_roles: {
+    keyPath: "id",
+    indexes: [
+      { name: "pin",        keyPath: "pin",        unique: true  },
+      { name: "systemRole", keyPath: "systemRole", unique: false }
+    ]
+  },
+  departments: {
+    keyPath: "id",
+    indexes: [ { name: "order", keyPath: "order", unique: false } ]
+  },
+  // One row per checkpoint (flat), grouped in UI by deptId -> categoryId
+  checklist_structure: {
+    keyPath: "id",
+    indexes: [
+      { name: "deptId",     keyPath: "deptId",     unique: false },
+      { name: "categoryId", keyPath: "categoryId", unique: false }
+    ]
+  },
+  // Category-level weights (%) live here; editable by admin
+  checklist_categories: {
+    keyPath: "id",
+    indexes: [ { name: "deptId", keyPath: "deptId", unique: false } ]
+  },
+  penalties: { keyPath: "id" },
+  orgRoles:  { keyPath: "id", indexes: [ { name: "order", keyPath: "order", unique: false } ] },
+  // RBAC + org/geo (Phase B)
+  roles:     { keyPath: "id" },
+  geo_nodes: { keyPath: "id", indexes: [ { name: "parentId", keyPath: "parentId", unique: false }, { name: "type", keyPath: "type", unique: false } ] },
+  positions: { keyPath: "id", indexes: [ { name: "parentId", keyPath: "parentId", unique: false } ] },
+  dispute_policies: { keyPath: "id" },
+  report_access: { keyPath: "id", indexes: [ { name: "auditId", keyPath: "auditId", unique: false }, { name: "userId", keyPath: "userId", unique: false } ] },
+  audits_history: {
+    keyPath: "id",
+    indexes: [
+      { name: "status",    keyPath: "status",    unique: false },
+      { name: "auditorId", keyPath: "auditorId", unique: false },
+      { name: "startedAt", keyPath: "startedAt", unique: false }
+    ]
+  },
+  audit_violations: {
+    keyPath: "id",
+    indexes: [
+      { name: "auditId",     keyPath: "auditId",     unique: false },
+      { name: "checkpointId",keyPath: "checkpointId",unique: false },
+      { name: "deptId",      keyPath: "deptId",      unique: false }
+    ]
+  },
+  // Outbound queue for offline -> Google Sheets sync
+  syncQueue: {
+    keyPath: "qid",
+    indexes: [ { name: "createdAt", keyPath: "createdAt", unique: false } ]
+  }
+};
+
+/* ---------- Enumerations ---------- */
+const SYSTEM_ROLES = { ADMIN: "admin", AUDITOR: "auditor" };
+const AUDIT_STATUS = {
+  IN_PROGRESS: "in_progress",
+  PAUSED:      "paused",
+  COMPLETED:   "completed",
+  ABORTED:     "aborted"
+};
+const AUDIT_SCOPE = { SINGLE: "single", ALL: "all" };
+const SEVERITY = { CRITICAL: "critical", NON_CRITICAL: "non_critical" };
+const THREAD_AUTHOR = { AUDITOR: "auditor", RESTAURANT: "restaurant", SYSTEM: "system" };
+const VIO_STATUS = {
+  OPEN: "open", FIX_SUBMITTED: "fix_submitted", RESOLVED: "resolved",
+  DISPUTED: "disputed", DISPUTE_UPHELD: "dispute_upheld", DISPUTE_REJECTED: "dispute_rejected"
+};
+
+/* Permission catalog — grouped checkboxes admin toggles into roles. "*" = all. */
+const PERMISSION_GROUPS = [
+  { group: "Аудит", perms: [
+    { id: "audit.conduct",   label: "Проводить аудит" },
+    { id: "audit.viewOwn",   label: "Видеть свои аудиты" },
+    { id: "audit.viewScope", label: "Видеть аудиты своей области" },
+    { id: "audit.viewAll",   label: "Видеть все аудиты" },
+    { id: "audit.delete",    label: "Удалять аудиты" }
+  ] },
+  { group: "Отчёты и аналитика", perms: [
+    { id: "report.view",    label: "Просмотр отчётов" },
+    { id: "report.export",  label: "Экспорт отчётов" },
+    { id: "report.share",   label: "Делиться отчётами" },
+    { id: "analytics.view", label: "Аналитика и тренды" }
+  ] },
+  { group: "Задачи и оспаривания", perms: [
+    { id: "task.assign",     label: "Назначать ответственных" },
+    { id: "task.resolve",    label: "Закрывать нарушения" },
+    { id: "dispute.raise",   label: "Оспаривать нарушения" },
+    { id: "dispute.approve", label: "Согласовывать оспаривания" }
+  ] },
+  { group: "Администрирование", perms: [
+    { id: "checklist.edit", label: "Редактировать чек-листы" },
+    { id: "users.manage",   label: "Управление пользователями" },
+    { id: "roles.manage",   label: "Управление ролями" },
+    { id: "geo.manage",     label: "Управление географией" },
+    { id: "org.manage",     label: "Управление должностями" }
+  ] }
+];
+const ALL_PERMISSIONS = PERMISSION_GROUPS.reduce((a, g) => a.concat(g.perms.map(p => p.id)), []);
+function permLabel(id) {
+  for (const g of PERMISSION_GROUPS) { const p = g.perms.find(x => x.id === id); if (p) return p.label; }
+  return id;
+}
+
+/* ---------- Seed data (first launch only) ---------- */
+const SEED = {
+  users_roles: [
+    { id: "u_admin",   name: "Администратор", login: "admin",  position: "Администратор системы", pin: "0000", roleIds: ["role_admin"],   scope: [], active: true },
+    { id: "u_auditor", name: "Белько Лилия",  login: "liliya", position: "Аудитор",               pin: "1111", roleIds: ["role_auditor"], scope: [], active: true }
+  ],
+
+  // Default roles (admin can edit / add). "*" grants everything.
+  roles: [
+    { id: "role_admin",   name: "Администратор", system: true, permissions: ["*"] },
+    { id: "role_auditor", name: "Аудитор",       system: false, permissions: ["audit.conduct", "audit.viewOwn", "report.view", "report.export", "task.assign"] },
+    { id: "role_director", name: "Директор ресторана", system: false, permissions: ["audit.conduct", "audit.viewScope", "report.view", "report.export", "analytics.view", "task.assign", "task.resolve", "dispute.approve"] }
+  ],
+
+  departments: [
+    { id: "dept_bar",      name: "Бар",      order: 1 },
+    { id: "dept_kitchen",  name: "Кухня",    order: 2 },
+    { id: "dept_hall",     name: "Зал",      order: 3 },
+    { id: "dept_delivery", name: "Доставка", order: 4 }
+  ],
+
+  // Penalty presets (%), admin-configurable
+  penalties: [
+    { id: "pen_minor",    label: "Незначительное", percent: 5  },
+    { id: "pen_major",    label: "Значительное",   percent: 15 },
+    { id: "pen_critical", label: "Критическое",    percent: 50 }
+  ],
+
+  // Organizational roles for "Fix by..." assignment (admin can append)
+  orgRoles: [
+    { id: "role_director",   title: "Директор ресторана",          order: 1  },
+    { id: "role_chef",       title: "Шеф-повар",                   order: 2  },
+    { id: "role_souschef",   title: "Су-шеф",                      order: 3  },
+    { id: "role_linecook",   title: "Повар (горячий/холодный/суши)", order: 4 },
+    { id: "role_prep",       title: "Повар заготовки",             order: 5  },
+    { id: "role_sanitation", title: "Мойщик / Клинер",             order: 6  },
+    { id: "role_barmanager", title: "Бар-менеджер",                order: 7  },
+    { id: "role_bartender",  title: "Бармен",                      order: 8  },
+    { id: "role_waiter",     title: "Официант / Хостес",           order: 9  },
+    { id: "role_technician", title: "Техник / Хаусмен",            order: 10 }
+  ],
+
+  // Full BAR checklist imported from the provided Excel.
+  // Other departments start empty and are filled via the Constructor.
+  bar_checklist: [
+      {
+            "id": "cat_bar_1",
+            "code": "1",
+            "name": "ОБОРУДОВАНИЕ",
+            "weight": 20.0,
+            "checkpoints": [
+                  {
+                        "id": "chk_bar_1",
+                        "index": "1.1",
+                        "object": "Морозильное / Холодильное оборудование",
+                        "criterion": "Чистота",
+                        "requirement": "Оборудование чистое, уплотнительные резинки не загрязнены, отсутствуют остатки пищи, полки и стенки внутри чистые. Отсутствуют посторонние запахи."
+                  },
+                  {
+                        "id": "chk_bar_2",
+                        "index": "1.1",
+                        "object": "Морозильное / Холодильное оборудование",
+                        "criterion": "Исправность",
+                        "requirement": "Поддерживается установленный температурный режим, термометр в наличии(для оборудования не имеющий термометр). Охлаждающий агрегат не издает посторонних звуков, не протекает. Уплотнительные резинки цельные, без повреждений."
+                  },
+                  {
+                        "id": "chk_bar_3",
+                        "index": "1.2",
+                        "object": "Ледогенератор",
+                        "criterion": "Чистота",
+                        "requirement": "В бункере для сбора льда нет налета, наледи, остатков пищи, жира, грязных засохших пятен, застарелых подтеков, загрязнений. Трубка для слива и сливное отверстие чистые, без грязи, слизи, остатков пищи."
+                  },
+                  {
+                        "id": "chk_bar_4",
+                        "index": "1.2",
+                        "object": "Ледогенератор",
+                        "criterion": "Исправность",
+                        "requirement": "Оборудование запускается при включении, не течет, производится лед. Совок для льда в наличии, в бункере отсутствуют посторонние предметы. Совок хранится отдельно."
+                  },
+                  {
+                        "id": "chk_bar_5",
+                        "index": "1.3",
+                        "object": "Кофемашина",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налета от кофе, остатков пищи, пароотводы не забиты, на поверхности мармитов нет ничего лишнего. Холдеры чистые, без черного налета (Латунный цвет не является нарушением) В наличии химия для промывки, глухой рожок (слепой рожок, слепой фильтр) Пролив 30мл +- 1-3мл с одинарного холдера за 22-26 секунд"
+                  },
+                  {
+                        "id": "chk_bar_6",
+                        "index": "1.3",
+                        "object": "Кофемашина",
+                        "criterion": "Исправность",
+                        "requirement": "Нет контакта холдера с мусорным баком. Работает в штатном режиме. Все конструктивные части целые, не деформированы и не шатаются."
+                  },
+                  {
+                        "id": "chk_bar_7",
+                        "index": "1.4",
+                        "object": "Кофемолка",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налёта, засохших подтеков."
+                  },
+                  {
+                        "id": "chk_bar_8",
+                        "index": "1.4",
+                        "object": "Кофемолка",
+                        "criterion": "Исправность",
+                        "requirement": "Темпер хранится в чистом сухом месте. При включении сразу начинает намалывать. Помол настроен по текущему ТТК (Обычно 8-9гр за 1 эспрессо) Все конструктивные части целые, не деформированы и не шатаются. Проводилась плановая настройка помола"
+                  },
+                  {
+                        "id": "chk_bar_9",
+                        "index": "1.5",
+                        "object": "Зона для разлива бочкового пива (Драфт)",
+                        "criterion": "Чистота",
+                        "requirement": "Место для бочкового пива содержится в чистоте и порядке. Стоки для пива чистые и не издают неприятного запаха. Имеется журнал посещения от поставщика пива, проводилась плановая чистка каналов неменее двух раз в месяц."
+                  },
+                  {
+                        "id": "chk_bar_10",
+                        "index": "1.5",
+                        "object": "Зона для разлива бочкового пива (Драфт)",
+                        "criterion": "Исправность",
+                        "requirement": "Давление углекислого газа в баллонах в норме. Все конструктивные части целые, не деформированы и не шатаются, редуктор работает исправно, информация актуальна."
+                  },
+                  {
+                        "id": "chk_bar_11",
+                        "index": "1.6",
+                        "object": "Блендер",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налёта, подтеков, остатков пищи."
+                  },
+                  {
+                        "id": "chk_bar_12",
+                        "index": "1.6",
+                        "object": "Блендер",
+                        "criterion": "Исправность",
+                        "requirement": "Работает в штатном режиме. Нет сколов, трещин, муфта и все конструктивные части целые, не деформированы и не шатаются."
+                  },
+                  {
+                        "id": "chk_bar_13",
+                        "index": "1.7",
+                        "object": "Соковыжималки",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налета, подтеков, остатков пищи."
+                  },
+                  {
+                        "id": "chk_bar_14",
+                        "index": "1.7",
+                        "object": "Соковыжималки",
+                        "criterion": "Исправность",
+                        "requirement": "Работает плавно, вал вращается, нет вибрации при включении. Нет сколов, трещин, деформации, сито не отходит."
+                  },
+                  {
+                        "id": "chk_bar_15",
+                        "index": "1.8",
+                        "object": "Бойлер",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налёта (отсутствие водного камня, носик без накипи), засохших подтеков, остатков пищи."
+                  },
+                  {
+                        "id": "chk_bar_16",
+                        "index": "1.8",
+                        "object": "Бойлер",
+                        "criterion": "Исправность",
+                        "requirement": "Есть нагрев при включении в сеть, работает в штатном режиме. Кран и все конструктивные части целые, не деформированы."
+                  },
+                  {
+                        "id": "chk_bar_17",
+                        "index": "1.9",
+                        "object": "Весы",
+                        "criterion": "Чистота",
+                        "requirement": "Нет налета, остатков пищи, подтеков."
+                  },
+                  {
+                        "id": "chk_bar_18",
+                        "index": "1.9",
+                        "object": "Весы",
+                        "criterion": "Исправность",
+                        "requirement": "Весы в наличии, пломбы в сохранности, имеется поверка. Нет деформаций, сколов, трещин."
+                  },
+                  {
+                        "id": "chk_bar_19",
+                        "index": "1.10",
+                        "object": "Моечная раковина",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налета, остатков пищи. Щетки для мытья, средства для мытья посуды, прорезиненная тряпка в наличии и порядке."
+                  },
+                  {
+                        "id": "chk_bar_20",
+                        "index": "1.10",
+                        "object": "Моечная раковина",
+                        "criterion": "Исправность",
+                        "requirement": "Сантехника исправна, чистая, не протекает (краны подвода воды/слив исправны, не протекают, есть сетка на слив)."
+                  },
+                  {
+                        "id": "chk_bar_21",
+                        "index": "1.11",
+                        "object": "Коктейльная станция/зона для приготовления напитков",
+                        "criterion": "Чистота",
+                        "requirement": "Станция/поверхность содержится в чистоте и порядке. Слив не забит, отсутствует неприятный запах. Под металической сеткой чисто, проводилась плановая чистка неменее двух раз в неделю. В станции соблюдается температурный решим для продуктов (Продукты требуемые хранение в холодильнике погружены на 50% в краш лед)"
+                  },
+                  {
+                        "id": "chk_bar_22",
+                        "index": "1.12",
+                        "object": "Коктейльная станция/зона для приготовления напитков",
+                        "criterion": "Исправность",
+                        "requirement": "Все конструктивные части в наличии (металические съемные деления), целые, без дефектов и не шатаются. Слив работает исправно"
+                  }
+            ]
+      },
+      {
+            "id": "cat_bar_2",
+            "code": "2",
+            "name": "ПРОДУКТЫ",
+            "weight": 20.0,
+            "checkpoints": [
+                  {
+                        "id": "chk_bar_23",
+                        "index": "2.1",
+                        "object": "Алкогольная продукция, сиропы, топпинги",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налета, подтеков, остатков пищи, бутылки не липкие, закрыты помпой/крышкой/пробкой (закрытие пленкой или иными предметами недопустимо)."
+                  },
+                  {
+                        "id": "chk_bar_24",
+                        "index": "2.1",
+                        "object": "Алкогольная продукция, сиропы, топпинги",
+                        "criterion": "Стандарты и Маркировка",
+                        "requirement": "Алкогольная продукция промаркирована датой открытия бутылки, акцизные марки имеются, виден QR и серийный номер."
+                  },
+                  {
+                        "id": "chk_bar_25",
+                        "index": "2.2",
+                        "object": "Температура и условия хранения продуктов",
+                        "criterion": "Чистота",
+                        "requirement": "Продукция хранится в чистых промаркированных гастроемкостях, в закрытом виде. В гастроемкостях отсутствует столовая или одноразовая посуда, производственный инвентарь."
+                  },
+                  {
+                        "id": "chk_bar_26",
+                        "index": "2.2",
+                        "object": "Температура и условия хранения продуктов",
+                        "criterion": "Стандарты хранения и Маркировка",
+                        "requirement": "Условия хранения и температурный режим хранения продуктов соответствуют требованиям, сроки хранения продуктов соответствуют стандартам Компании."
+                  },
+                  {
+                        "id": "chk_bar_27",
+                        "index": "2.4",
+                        "object": "Маркировка продуктов",
+                        "criterion": "Стандарты хранения и Маркировка",
+                        "requirement": "Внутренняя маркировка, наименования продуктов в наличии и читаемое, без видимых повреждений. Аннотация от поставщиков в наличии."
+                  },
+                  {
+                        "id": "chk_bar_28",
+                        "index": "2.5",
+                        "object": "Товарное соседство",
+                        "criterion": "Ротация",
+                        "requirement": "Вся продукция хранится в соответствии с принципом товарного соседства."
+                  },
+                  {
+                        "id": "chk_bar_29",
+                        "index": "2.6",
+                        "object": "Ротация продуктов",
+                        "criterion": "Ротация",
+                        "requirement": "Продукты выставлены и используются по правилу «Первый пришел — первый ушел», отсутствуют две одновременно открытые банки/упаковки одной позиции."
+                  },
+                  {
+                        "id": "chk_bar_30",
+                        "index": "2.7",
+                        "object": "Зоны хранения продуктов",
+                        "criterion": "Ротация",
+                        "requirement": "Продукты, напитки, одноразовая посуда, одноразовые перчатки, рабочий инвентарь, химические средства и инвентарь для уборки хранятся отдельно от продуктов."
+                  },
+                  {
+                        "id": "chk_bar_31",
+                        "index": "2.8",
+                        "object": "Стоп-лист",
+                        "criterion": "Стоп-лист",
+                        "requirement": "На момент открытия смены стоп-лист отсутствует, все позиции меню и необходимые ингредиенты находятся в наличии в объеме, достаточном для бесперебойной работы заведения до следующей плановой поставки."
+                  },
+                  {
+                        "id": "chk_bar_32",
+                        "index": "2.9",
+                        "object": "Гоу-лист",
+                        "criterion": "Гоу-лист",
+                        "requirement": "Гоу-лист заполнен позициями, требующими первоочередной реализации. Персонал сервиса зала полностью проинформирован о приоритетах продаж до начала обслуживания гостей."
+                  }
+            ]
+      },
+      {
+            "id": "cat_bar_3",
+            "code": "3",
+            "name": "ПРОИЗВОДСТВЕННОЕ ПОМЕЩЕНИЕ",
+            "weight": 20.0,
+            "checkpoints": [
+                  {
+                        "id": "chk_bar_33",
+                        "index": "3.1",
+                        "object": "Разделочные доски",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет глубоких трещин и порезов, деформации."
+                  },
+                  {
+                        "id": "chk_bar_34",
+                        "index": "3.2",
+                        "object": "Ножи",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет загрязнений, остатков пищи, нет запаха. Промаркированы в соответствии с требованиями и используются по назначению."
+                  },
+                  {
+                        "id": "chk_bar_35",
+                        "index": "3.3",
+                        "object": "Мерные стаканы",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет загрязнений, остатков пищи, нет запаха, нет сколов, деформации."
+                  },
+                  {
+                        "id": "chk_bar_36",
+                        "index": "3.4",
+                        "object": "Контейнеры, гастроёмкости",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет загрязнений, подтеков, налета, остатков пищи. Нет сколов, деформации."
+                  },
+                  {
+                        "id": "chk_bar_37",
+                        "index": "3.5",
+                        "object": "Барный инвентарь (питчер, джиггер и др.)",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет налёта/загрязнений, остатков пищи, ржавчины, грязи, вмятин, деформации."
+                  },
+                  {
+                        "id": "chk_bar_38",
+                        "index": "3.5",
+                        "object": "Барный инвентарь (питчер, джиггер и др.)",
+                        "criterion": "Исправность",
+                        "requirement": "В наличии полный ассортимент в соответствии с перечнем."
+                  },
+                  {
+                        "id": "chk_bar_39",
+                        "index": "3.6",
+                        "object": "Банки для чая, для специй",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет загрязнений, налёта, подтеков, остатков пищи, влаги, отсутствуют посторонние предметы внутри. В наличии полный ассортимент."
+                  },
+                  {
+                        "id": "chk_bar_40",
+                        "index": "3.7",
+                        "object": "Посуда гостевая",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налёта, подтёков, остатков пищи, нет сколов, трещин, затертости. Соблюдается зона Гостя."
+                  },
+                  {
+                        "id": "chk_bar_41",
+                        "index": "3.7",
+                        "object": "Посуда гостевая",
+                        "criterion": "Целостность",
+                        "requirement": "Используется по назначению, чайники неплотно закрытые, храниться на барной сетке. В наличии полный ассортимент в соответствии с перечнем."
+                  },
+                  {
+                        "id": "chk_bar_42",
+                        "index": "3.8",
+                        "object": "Рабочие поверхности",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налёта, подтёков, остатков пищи, нет сколов, трещин, вмятин."
+                  },
+                  {
+                        "id": "chk_bar_43",
+                        "index": "3.9",
+                        "object": "Зона сервис-бара",
+                        "criterion": "Чистота",
+                        "requirement": "Нет загрязнений, налета, пыли, трубочки расположены с соблюдением правила Зоны Гостя, запрещено наличие грязной посуды. Приборы хранятся ручкой вверх."
+                  }
+            ]
+      },
+      {
+            "id": "cat_bar_4",
+            "code": "4",
+            "name": "ПОМЕЩЕНИЕ",
+            "weight": 20.0,
+            "checkpoints": [
+                  {
+                        "id": "chk_bar_44",
+                        "index": "4.1",
+                        "object": "Помещение: пол, стены, потолок",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет загрязнений, скопление пыли, подтеков, посторонних надписей/рисунков/наклеек, следов краски, скотча/пленки. Все конструктивные части целые, не деформированные."
+                  },
+                  {
+                        "id": "chk_bar_45",
+                        "index": "4.2",
+                        "object": "Мебель: полки, стеллажи",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет мусора, загрязнений, нет сколов, трещин, все конструктивные части целые, не деформированные."
+                  },
+                  {
+                        "id": "chk_bar_46",
+                        "index": "4.3",
+                        "object": "Освещение",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет загрязнения, нет насекомых и следов присутствия насекомых. Все лампы горят, нет сколов, трещин, деформаций."
+                  },
+                  {
+                        "id": "chk_bar_47",
+                        "index": "4.4",
+                        "object": "Бак для отходов",
+                        "criterion": "Чистота и состояние",
+                        "requirement": "Нет грязи и подтеков, бак заправлен новым мусорным мешком, не переполнен больше 70%"
+                  }
+            ]
+      },
+      {
+            "id": "cat_bar_5",
+            "code": "5",
+            "name": "СТАНДАРТЫ",
+            "weight": 20.0,
+            "checkpoints": [
+                  {
+                        "id": "chk_bar_48",
+                        "index": "5.1",
+                        "object": "Станционные карты",
+                        "criterion": "Документы",
+                        "requirement": "ТТК (рецептуры) в наличии, актуальные, стационарные карты заламенированы, находится в доступе у барменов"
+                  },
+                  {
+                        "id": "chk_bar_49",
+                        "index": "5.2",
+                        "object": "Личные вещи",
+                        "criterion": "Стандарты",
+                        "requirement": "Личные и посторонние вещи (сумки, обувь, книги и др.) не хранятся в баре."
+                  },
+                  {
+                        "id": "chk_bar_50",
+                        "index": "5.3",
+                        "object": "Списания/перемещения",
+                        "criterion": "Документы",
+                        "requirement": "Шаблон бланка актуальный, в наличии. Утилизированные/перемещенные продукты записаны в соответствующий бланк, информация (Дата, ответственные лица, продукты) актуальны"
+                  }
+            ]
+      }
+]
+};
+</script>
+
+<!-- ============================================================
+     STEP 3 — APP CORE: IndexedDB, state, scoring, auth, router
+     ============================================================ -->
+<script id="app-core">
+"use strict";
+
+/* ===================== IndexedDB thin wrapper ===================== */
+const IDB = {
+  _db: null,
+  open() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(APP_CONFIG.db.name, APP_CONFIG.db.version);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        Object.keys(DB_SCHEMA).forEach((name) => {
+          if (db.objectStoreNames.contains(name)) return;
+          const cfg = DB_SCHEMA[name];
+          const store = db.createObjectStore(name, { keyPath: cfg.keyPath });
+          (cfg.indexes || []).forEach((ix) =>
+            store.createIndex(ix.name, ix.keyPath, { unique: !!ix.unique }));
+        });
+      };
+      req.onsuccess = (e) => { this._db = e.target.result; resolve(this._db); };
+      req.onerror = (e) => reject(e.target.error);
+    });
+  },
+  _tx(store, mode) { return this._db.transaction(store, mode).objectStore(store); },
+  getAll(store) {
+    return new Promise((res, rej) => {
+      const r = this._tx(store, "readonly").getAll();
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  },
+  get(store, key) {
+    return new Promise((res, rej) => {
+      const r = this._tx(store, "readonly").get(key);
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  },
+  put(store, val) {
+    return new Promise((res, rej) => {
+      const r = this._tx(store, "readwrite").put(val);
+      r.onsuccess = () => res(val); r.onerror = () => rej(r.error);
+    });
+  },
+  bulkPut(store, arr) {
+    return new Promise((res, rej) => {
+      const os = this._tx(store, "readwrite"); let i = 0;
+      if (!arr.length) return res(0);
+      arr.forEach((v) => { const r = os.put(v); r.onsuccess = () => { if (++i === arr.length) res(i); }; r.onerror = () => rej(r.error); });
+    });
+  },
+  del(store, key) {
+    return new Promise((res, rej) => {
+      const r = this._tx(store, "readwrite").delete(key);
+      r.onsuccess = () => res(true); r.onerror = () => rej(r.error);
+    });
+  },
+  count(store) {
+    return new Promise((res, rej) => {
+      const r = this._tx(store, "readonly").count();
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  },
+  byIndex(store, index, value) {
+    return new Promise((res, rej) => {
+      const r = this._tx(store, "readonly").index(index).getAll(value);
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  }
+};
+
+/* ===================== Data access + first-launch seed ===================== */
+const DB = {
+  async init() { await IDB.open(); await this.seedIfEmpty(); await this.ensureSeed(); },
+
+  // Fills data that may be missing on already-seeded (upgraded) databases.
+  async ensureSeed() {
+    if (await IDB.count("roles") === 0) await IDB.bulkPut("roles", SEED.roles);
+    const users = await IDB.getAll("users_roles");
+    for (const su of SEED.users_roles) {
+      const ex = users.find(u => u.id === su.id);
+      if (!ex) await IDB.put("users_roles", su);
+      else if (!ex.login) await IDB.put("users_roles", Object.assign(ex, { login: su.login, position: su.position, roleIds: su.roleIds, scope: su.scope || [] }));
+    }
+  },
+
+  async seedIfEmpty() {
+    if (await IDB.count("departments") > 0) return;
+    await IDB.bulkPut("users_roles", SEED.users_roles);
+    await IDB.bulkPut("roles", SEED.roles);
+    await IDB.bulkPut("departments", SEED.departments);
+    await IDB.bulkPut("penalties", SEED.penalties);
+    await IDB.bulkPut("orgRoles", SEED.orgRoles);
+
+    // Flatten BAR checklist -> categories + checkpoints
+    const cats = [], checks = [];
+    SEED.bar_checklist.forEach((c) => {
+      cats.push({ id: c.id, deptId: "dept_bar", code: c.code, name: c.name, weight: c.weight });
+      c.checkpoints.forEach((cp) =>
+        checks.push({ id: cp.id, deptId: "dept_bar", categoryId: c.id,
+          index: cp.index, object: cp.object, criterion: cp.criterion, requirement: cp.requirement }));
+    });
+    await IDB.bulkPut("checklist_categories", cats);
+    await IDB.bulkPut("checklist_structure", checks);
+  },
+
+  users()       { return IDB.getAll("users_roles"); },
+  saveUser(u)   { return IDB.put("users_roles", u); },
+  delUser(id)   { return IDB.del("users_roles", id); },
+  roles()       { return IDB.getAll("roles"); },
+  saveRole(r)   { return IDB.put("roles", r); },
+  delRole(id)   { return IDB.del("roles", id); },
+  geoNodes()    { return IDB.getAll("geo_nodes"); },
+  saveGeo(n)    { return IDB.put("geo_nodes", n); },
+  delGeo(id)    { return IDB.del("geo_nodes", id); },
+  positions()   { return IDB.getAll("positions"); },
+  savePosition(p) { return IDB.put("positions", p); },
+  delPosition(id) { return IDB.del("positions", id); },
+  policies()    { return IDB.getAll("dispute_policies"); },
+  savePolicy(p) { return IDB.put("dispute_policies", p); },
+  delPolicy(id) { return IDB.del("dispute_policies", id); },
+  access()      { return IDB.getAll("report_access"); },
+  saveAccess(g) { return IDB.put("report_access", g); },
+  delAccess(id) { return IDB.del("report_access", id); },
+  departments() { return IDB.getAll("departments").then(d => d.sort((a,b)=>a.order-b.order)); },
+  penalties()   { return IDB.getAll("penalties").then(p => p.sort((a, b) => a.percent - b.percent)); },
+  orgRoles()    { return IDB.getAll("orgRoles").then(r => r.sort((a,b)=>a.order-b.order)); },
+  categories(deptId) { return IDB.byIndex("checklist_categories", "deptId", deptId); },
+  checkpoints(deptId) { return IDB.byIndex("checklist_structure", "deptId", deptId); },
+  audits()      { return IDB.getAll("audits_history"); },
+  saveAudit(a)  { return IDB.put("audits_history", a); },
+  saveViolation(v) { return IDB.put("audit_violations", v); },
+  violations(auditId) { return IDB.byIndex("audit_violations", "auditId", auditId); }
+};
+
+/* ===================== Session (localStorage) ===================== */
+const Session = {
+  KEY: "tanuki_session",
+  data: { userId: null, route: "login", theme: "light" },
+  load() { try { Object.assign(this.data, JSON.parse(localStorage.getItem(this.KEY) || "{}")); } catch (e) {} return this.data; },
+  save() { localStorage.setItem(this.KEY, JSON.stringify(this.data)); },
+  set(patch) { Object.assign(this.data, patch); this.save(); },
+  clear() { this.data.userId = null; this.data.route = "login"; this.save(); }
+};
+
+/* ===================== Scoring engine (percentage model) ===================== */
+const Scoring = {
+  // categories: [{id,weight}], structure: [{id,categoryId}], violations: [{checkpointId,penaltyPercent}]
+  categoryScores(categories, structure, violations) {
+    const cpToCat = {}; structure.forEach(s => cpToCat[s.id] = s.categoryId);
+    const scores = {}; categories.forEach(c => scores[c.id] = 100);
+    violations.forEach(v => {
+      const cat = v.categoryId || cpToCat[v.checkpointId];
+      if (cat == null || scores[cat] == null) return;
+      scores[cat] = Math.max(0, scores[cat] - (Number(v.penaltyPercent) || 0));
+    });
+    return scores; // {categoryId: percent}
+  },
+  deptScore(categories, catScores) {
+    const totW = categories.reduce((s, c) => s + (Number(c.weight) || 0), 0) || 1;
+    const sum = categories.reduce((s, c) => s + catScores[c.id] * (Number(c.weight) || 0), 0);
+    return Math.round((sum / totW) * 10) / 10;
+  },
+  finalScore(deptScores) {
+    const vals = Object.values(deptScores);
+    if (!vals.length) return 0;
+    return Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10;
+  }
+};
+
+/* ===================== Theme ===================== */
+const Theme = {
+  apply() { document.documentElement.classList.toggle("dark", Session.data.theme === "dark"); },
+  toggle() { Session.set({ theme: Session.data.theme === "dark" ? "light" : "dark" }); this.apply(); App.render(); }
+};
+
+/* ===================== Sync (Google Apps Script) ===================== */
+const Sync = {
+  online: navigator.onLine,
+  async ping() {
+    if (!APP_CONFIG.apiUrl) return false;
+    try {
+      const r = await fetch(APP_CONFIG.apiUrl + "?action=ping", { method: "GET" });
+      const j = await r.json(); return !!j.ok;
+    } catch (e) { return false; }
+  },
+  async pushAudit(audit, violations) {
+    if (!APP_CONFIG.apiUrl) throw new Error("apiUrl not set");
+    const res = await fetch(APP_CONFIG.apiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" }, // simple request -> no CORS preflight
+      body: JSON.stringify({ type: "audit_sync", audit, violations })
+    });
+    return res.json();
+  },
+  // Offline-safe queue: enqueue on finish/abort, flush when online.
+  _flushing: false,
+  async enqueue(auditId) {
+    try { await IDB.put("syncQueue", { qid: "q_" + auditId, auditId, createdAt: Date.now() }); } catch (e) {}
+    Sync.flush();
+  },
+  async dequeue(auditId) { try { await IDB.del("syncQueue", "q_" + auditId); } catch (e) {} },
+  async flush() {
+    if (Sync._flushing || !APP_CONFIG.apiUrl || !navigator.onLine) return;
+    Sync._flushing = true;
+    let progressed = false;
+    try {
+      const q = await IDB.getAll("syncQueue");
+      for (const item of q) {
+        const audit = await IDB.get("audits_history", item.auditId);
+        if (!audit) { await IDB.del("syncQueue", item.qid); progressed = true; continue; }
+        try {
+          const vios = await DB.violations(item.auditId);
+          const res = await Sync.pushAudit(audit, vios);
+          if (res && res.ok) { await IDB.del("syncQueue", item.qid); progressed = true; }
+          else break; // server error -> keep queue, retry on next trigger
+        } catch (e) { break; } // network error -> keep queue, retry on next trigger
+      }
+    } finally {
+      Sync._flushing = false;
+      // Only re-drain if we made progress AND items remain (added mid-flush) — avoids hammering on persistent errors.
+      if (progressed && navigator.onLine && (await Sync.pendingCount()) > 0) setTimeout(() => Sync.flush(), 1500);
+    }
+  },
+  async pendingCount() { try { return (await IDB.getAll("syncQueue")).length; } catch (e) { return 0; } }
+};
+
+/* ===================== Media: client-side image compression ===================== */
+const Media = {
+  compress(file, maxDim, quality) {
+    maxDim = maxDim || 1280; quality = quality || 0.7;
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        let { width: w, height: h } = img;
+        if (w > h && w > maxDim) { h = Math.round(h * maxDim / w); w = maxDim; }
+        else if (h > maxDim) { w = Math.round(w * maxDim / h); h = maxDim; }
+        const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+        cv.getContext("2d").drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        resolve(cv.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("image load failed")); };
+      img.src = url;
+    });
+  }
+};
+
+/* ===================== Voice: speech-to-text (webkitSpeechRecognition) ===================== */
+const Voice = {
+  rec: null, active: false,
+  supported() { return "webkitSpeechRecognition" in window || "SpeechRecognition" in window; },
+  toggle(onResult, onEnd) {
+    if (this.active) { this.stop(); return; }
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return false;
+    const r = new SR();
+    r.lang = "ru-RU"; r.interimResults = true; r.continuous = true;
+    let finalText = "";
+    r.onresult = (e) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t + " "; else interim += t;
+      }
+      onResult(finalText + interim);
+    };
+    r.onend = () => { this.active = false; if (onEnd) onEnd(finalText.trim()); };
+    r.onerror = () => { this.active = false; if (onEnd) onEnd(finalText.trim()); };
+    this.rec = r; this.active = true; r.start();
+    return true;
+  },
+  stop() { if (this.rec) { try { this.rec.stop(); } catch (e) {} } this.active = false; }
+};
+
+/* ===================== Audit controller ===================== */
+const Audit = {
+  // Active audit + cached checklist data for the run
+  active: null,
+  data: { categories: {}, checkpoints: {}, violations: [] },
+  ui: { deptId: null, openCat: null },
+
+  deptsWithContent(all) {
+    return all.filter(d => (Audit.data.categories[d.id] || []).length > 0);
+  },
+
+  async start(scope, deptIds) {
+    const now = new Date();
+    Audit.active = {
+      id: "aud_" + now.getTime(),
+      auditorId: App.user.id, auditorName: App.user.name,
+      scope: scope, deptIds: deptIds.slice(),
+      restaurantId: App.setup.restaurantId || "",
+      restaurant: (function () { const r = (App.setup.restaurants || []).find(x => x.id === App.setup.restaurantId); return r ? r.name : ""; })(),
+      startedAt: now.toISOString(),
+      status: AUDIT_STATUS.IN_PROGRESS,
+      finishedAt: null, scores: {}, finalScore: null
+    };
+    await Audit._loadData(deptIds);
+    Audit.data.violations = [];
+    Audit.ui = { deptId: deptIds[0], openCat: null };
+    await DB.saveAudit(Audit.active);
+    App.route("audit_run");
+  },
+
+  async resume(id) {
+    const a = await IDB.get("audits_history", id);
+    if (!a) return;
+    Audit.active = a;
+    await Audit._loadData(a.deptIds);
+    Audit.data.violations = await DB.violations(id);
+    Audit.ui = { deptId: a.deptIds[0], openCat: null };
+    if (a.status === AUDIT_STATUS.PAUSED) { a.status = AUDIT_STATUS.IN_PROGRESS; await DB.saveAudit(a); }
+    App.route("audit_run");
+  },
+
+  async _loadData(deptIds) {
+    Audit.data.categories = {}; Audit.data.checkpoints = {};
+    for (const id of deptIds) {
+      const cats = (await DB.categories(id)).sort((a, b) => Number(a.code) - Number(b.code));
+      const chks = (await DB.checkpoints(id)).sort((a, b) => {
+        const pa = String(a.index).split(".").map(Number), pb = String(b.index).split(".").map(Number);
+        return (pa[0] - pb[0]) || ((pa[1] || 0) - (pb[1] || 0));
+      });
+      Audit.data.categories[id] = cats;
+      Audit.data.checkpoints[id] = chks;
+    }
+  },
+
+  violationsFor(checkpointId) {
+    return Audit.data.violations.filter(v => v.checkpointId === checkpointId);
+  },
+
+  recompute() {
+    const a = Audit.active; const scores = {};
+    a.deptIds.forEach(deptId => {
+      const cats = Audit.data.categories[deptId] || [];
+      const struct = Audit.data.checkpoints[deptId] || [];
+      const vios = Audit.data.violations.filter(v => v.deptId === deptId);
+      const catScores = Scoring.categoryScores(cats, struct, vios);
+      scores[deptId] = { categories: catScores, score: Scoring.deptScore(cats, catScores) };
+    });
+    a.scores = scores;
+    a.finalScore = Scoring.finalScore(Object.fromEntries(a.deptIds.map(d => [d, scores[d].score])));
+    return a;
+  },
+
+  async persist() { await DB.saveAudit(Audit.recompute()); },
+
+  async addViolation(v) {
+    Audit.data.violations.push(v);
+    await DB.saveViolation(v);
+    await Audit.persist();
+  },
+  async removeViolation(id) {
+    Audit.data.violations = Audit.data.violations.filter(x => x.id !== id);
+    await IDB.del("audit_violations", id);
+    await Audit.persist();
+  },
+
+  async pause()  { Audit.active.status = AUDIT_STATUS.PAUSED; await Audit.persist(); Audit.active = null; App.route("home"); },
+  async finish() { const a = Audit.active; a.status = AUDIT_STATUS.COMPLETED; a.finishedAt = new Date().toISOString(); await Audit.persist(); Sync.enqueue(a.id); App.route("audit_done"); },
+  async abort()  { const a = Audit.active; a.status = AUDIT_STATUS.ABORTED; a.finishedAt = new Date().toISOString(); await Audit.persist(); Sync.enqueue(a.id); Audit.active = null; App.route("home"); }
+};
+
+/* ===================== Reports (PDF / Excel / HTML) ===================== */
+const Reports = {
+  _roleTitle(id, roles) { const r = roles.find(x => x.id === id); return r ? r.title : ""; },
+  _cp(deptData, deptId, cpId) { return (deptData.checkpoints[deptId] || []).find(c => c.id === cpId) || {}; },
+  _color(p) { return p >= 90 ? "#059669" : p >= 75 ? "#d97706" : "#EA1B24"; },
+  _esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); },
+  fname(m, ext) { return `Аудит_${m.scope}_${new Date().toISOString().slice(0, 10)}.${ext}`.replace(/\s+/g, "_"); },
+
+  buildModel(audit, deptData, violations, orgRoles) {
+    const depts = audit.deptIds.map(id => {
+      const sc = audit.scores[id] || { categories: {}, score: 100 };
+      const cats = (deptData.categories[id] || []).map(c => ({ name: c.name, weight: c.weight, score: Math.round(sc.categories[c.id] != null ? sc.categories[c.id] : 100) }));
+      return { id, name: App.deptName(id), score: Math.round(sc.score), categories: cats };
+    });
+    const vios = violations.map(v => {
+      const cp = Reports._cp(deptData, v.deptId, v.checkpointId);
+      return { deptName: App.deptName(v.deptId), index: cp.index || "", object: cp.object || "", criterion: cp.criterion || "",
+        severity: v.severity, penalty: v.penaltyPercent, comment: v.comment || "", assignee: Reports._roleTitle(v.assigneeRole, orgRoles),
+        time: App.fmtTime(v.createdAt), photos: v.photos || [] };
+    });
+    return {
+      auditor: audit.auditorName, date: App.fmtDate(audit.startedAt),
+      restaurant: audit.restaurant || "",
+      scope: audit.scope === "all" ? "Все подразделения" : App.deptName(audit.deptIds[0]),
+      finalScore: Math.round(audit.finalScore == null ? 100 : audit.finalScore),
+      depts, violations: vios,
+      critical: vios.filter(v => v.severity === SEVERITY.CRITICAL),
+      nonCritical: vios.filter(v => v.severity !== SEVERITY.CRITICAL)
+    };
+  },
+  async current() {
+    const orgRoles = await DB.orgRoles();
+    return Reports.buildModel(Audit.active, Audit.data, Audit.data.violations, orgRoles);
+  },
+
+  _vioBlock(v) {
+    const badge = v.severity === SEVERITY.CRITICAL
+      ? '<span style="background:#EA1B24;color:#fff;font-size:11px;padding:2px 8px;border-radius:999px">Критично</span>'
+      : '<span style="background:#e2e8f0;color:#334155;font-size:11px;padding:2px 8px;border-radius:999px">Некритично</span>';
+    const photos = v.photos.length
+      ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">${v.photos.map(p => `<img src="${p}" style="width:120px;height:120px;object-fit:cover;border-radius:8px;border:1px solid #e2e8f0" class="rep-photo">`).join("")}</div>` : "";
+    return `<div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin-bottom:10px;break-inside:avoid">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+        <div style="font-size:12px;color:#64748b">${Reports._esc(v.deptName)} · ${Reports._esc(v.index)} · ${Reports._esc(v.criterion)}</div>
+        <div style="display:flex;gap:6px;align-items:center">${badge}<span style="color:#EA1B24;font-weight:600;font-size:12px">−${v.penalty}%</span></div>
+      </div>
+      <div style="font-weight:600;margin-top:2px">${Reports._esc(v.object)}</div>
+      ${v.comment ? `<div style="font-size:13px;color:#334155;margin-top:4px">${Reports._esc(v.comment)}</div>` : ""}
+      <div style="font-size:12px;color:#64748b;margin-top:6px">${v.assignee ? "Ответственный: " + Reports._esc(v.assignee) + " · " : ""}${v.time}</div>
+      ${photos}</div>`;
+  },
+  htmlBody(m) {
+    const deptRows = m.depts.map(d => `
+      <tr><td style="padding:8px;border-bottom:1px solid #eef2f7;font-weight:600">${Reports._esc(d.name)}</td>
+        <td style="padding:8px;border-bottom:1px solid #eef2f7;text-align:right;color:${Reports._color(d.score)};font-weight:700">${d.score}%</td></tr>
+      ${d.categories.map(c => `<tr><td style="padding:4px 8px 4px 20px;border-bottom:1px solid #f8fafc;color:#475569;font-size:13px">${Reports._esc(c.name)} <span style="color:#94a3b8">· вес ${c.weight}%</span></td>
+        <td style="padding:4px 8px;border-bottom:1px solid #f8fafc;text-align:right;color:${Reports._color(c.score)};font-size:13px">${c.score}%</td></tr>`).join("")}`).join("");
+    return `<div style="font-family:Inter,Arial,sans-serif;color:#0f172a;max-width:800px;margin:0 auto">
+      <div style="display:flex;align-items:center;gap:12px;border-bottom:2px solid #EA1B24;padding-bottom:12px;margin-bottom:16px">
+        <svg width="64" height="40" viewBox="0 0 200 122"><rect x="3" y="3" width="194" height="116" rx="22" fill="#EA1B24"/><text x="100" y="55" text-anchor="middle" font-family="Arial" font-weight="800" font-size="38" fill="#fff">TANUKI</text><text x="100" y="100" text-anchor="middle" font-family="Arial" font-weight="800" font-size="38" fill="#fff">FAMILY</text></svg>
+        <div><div style="font-size:20px;font-weight:700">Отчёт по аудиту</div>
+          <div style="font-size:13px;color:#64748b">${m.restaurant ? Reports._esc(m.restaurant) + " · " : ""}${Reports._esc(m.scope)} · ${Reports._esc(m.date)} · Аудитор: ${Reports._esc(m.auditor)}</div></div>
+        <div style="margin-left:auto;text-align:right"><div style="font-size:11px;color:#64748b">Итог</div>
+          <div style="font-size:34px;font-weight:800;color:${Reports._color(m.finalScore)}">${m.finalScore}%</div></div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:20px">${deptRows}</table>
+      <div style="font-weight:700;margin:12px 0 8px;color:#EA1B24">Критические нарушения (${m.critical.length})</div>
+      ${m.critical.length ? m.critical.map(Reports._vioBlock).join("") : '<div style="color:#94a3b8;font-size:13px;margin-bottom:12px">Нет</div>'}
+      <div style="font-weight:700;margin:12px 0 8px">Некритические нарушения (${m.nonCritical.length})</div>
+      ${m.nonCritical.length ? m.nonCritical.map(Reports._vioBlock).join("") : '<div style="color:#94a3b8;font-size:13px">Нет</div>'}
+    </div>`;
+  },
+  htmlDoc(m) {
+    return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Отчёт · ${Reports._esc(m.scope)}</title>
+      <style>body{margin:0;padding:20px;background:#f8fafc}.rep-photo{cursor:zoom-in}#lb{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;z-index:99}#lb img{max-width:95%;max-height:95%}</style></head>
+      <body>${Reports.htmlBody(m)}<div id="lb" onclick="this.style.display='none'"><img></div>
+      <script>document.querySelectorAll('.rep-photo').forEach(function(i){i.onclick=function(){var lb=document.getElementById('lb');lb.querySelector('img').src=i.src;lb.style.display='flex'}})<\/script></body></html>`;
+  },
+  _download(name, blob) { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 3000); },
+
+  async exportHTML() { const m = await Reports.current(); Reports._download(Reports.fname(m, "html"), new Blob([Reports.htmlDoc(m)], { type: "text/html;charset=utf-8" })); },
+  async exportPDF() {
+    if (!window.html2pdf) { alert("Библиотека PDF ещё не загрузилась (нужен интернет при первом запуске)."); return; }
+    const m = await Reports.current();
+    const el = document.createElement("div"); el.style.padding = "12px"; el.style.background = "#fff"; el.innerHTML = Reports.htmlBody(m);
+    window.html2pdf().set({ margin: 8, filename: Reports.fname(m, "pdf"), image: { type: "jpeg", quality: 0.92 },
+      html2canvas: { scale: 2, useCORS: true }, jsPDF: { unit: "mm", format: "a4", orientation: "portrait" }, pagebreak: { mode: ["css", "avoid-all"] } }).from(el).save();
+  },
+  async exportExcel() {
+    if (!window.XLSX) { alert("Библиотека Excel ещё не загрузилась (нужен интернет при первом запуске)."); return; }
+    const m = await Reports.current();
+    const summary = [["Отчёт по аудиту"], ["Ресторан", m.restaurant || "—"], ["Аудитор", m.auditor], ["Дата", m.date], ["Охват", m.scope], ["Итоговая оценка", m.finalScore + "%"], [],
+      ["Подразделение", "Категория", "Вес %", "Оценка %"]];
+    m.depts.forEach(d => { summary.push([d.name, "", "", d.score]); d.categories.forEach(c => summary.push(["", c.name, c.weight, c.score])); });
+    const vh = [["Подразделение", "Индекс", "Объект", "Критерий", "Тип", "Штраф %", "Комментарий", "Ответственный", "Время"]];
+    m.violations.forEach(v => vh.push([v.deptName, v.index, v.object, v.criterion, v.severity === SEVERITY.CRITICAL ? "Критично" : "Некритично", v.penalty, v.comment, v.assignee, v.time]));
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, window.XLSX.utils.aoa_to_sheet(summary), "Сводка");
+    window.XLSX.utils.book_append_sheet(wb, window.XLSX.utils.aoa_to_sheet(vh), "Нарушения");
+    window.XLSX.writeFile(wb, Reports.fname(m, "xlsx"));
+  },
+
+  // Period / filtered statistics export (uses App.hist filtered set)
+  async exportPeriod() {
+    if (!window.XLSX) { alert("Библиотека Excel ещё не загрузилась (нужен интернет при первом запуске)."); return; }
+    const audits = App.hist.audits || [], vios = App.hist.vios || [];
+    if (!audits.length) { alert("Нет аудитов по выбранным фильтрам."); return; }
+    const f = App.histFilter;
+    const roleTitle = (id) => { const r = (App._orgRoles || []).find(x => x.id === id); return r ? r.title : ""; };
+    const cpMap = App.histRaw.cpMap;
+    const completed = audits.filter(a => a.status === AUDIT_STATUS.COMPLETED);
+    const avg = completed.length ? Math.round(completed.reduce((s, a) => s + (a.finalScore == null ? 100 : a.finalScore), 0) / completed.length) : "—";
+
+    const filterDesc = [
+      ["Сводный отчёт за период"],
+      ["Период", (f.from || "начало") + " — " + (f.to || "сегодня")],
+      ["Проверяющий", f.auditorId ? (audits.find(a => a.auditorId === f.auditorId) || {}).auditorName || f.auditorId : "все"],
+      ["Ресторан", f.restaurantId ? (audits.find(a => a.restaurantId === f.restaurantId) || {}).restaurant || f.restaurantId : "все"],
+      ["Подразделение", f.deptId ? App.deptName(f.deptId) : "все"],
+      ["Ответственный", f.assignee ? roleTitle(f.assignee) : "все"],
+      ["Сформирован", App.fmtDate(new Date().toISOString())],
+      [],
+      ["Аудитов", audits.length], ["Средняя оценка", avg + (avg === "—" ? "" : "%")], ["Всего нарушений", vios.length],
+      []
+    ];
+    // by restaurant
+    const byR = {}; completed.forEach(a => { const k = a.restaurant || "—"; (byR[k] = byR[k] || []).push(a.finalScore == null ? 100 : a.finalScore); });
+    filterDesc.push(["По ресторанам", "Аудитов", "Средняя %"]);
+    Object.entries(byR).forEach(([k, arr]) => filterDesc.push([k, arr.length, Math.round(arr.reduce((s, x) => s + x, 0) / arr.length)]));
+    filterDesc.push([]);
+    // by auditor
+    const byA = {}; completed.forEach(a => { const k = a.auditorName || "—"; (byA[k] = byA[k] || []).push(a.finalScore == null ? 100 : a.finalScore); });
+    filterDesc.push(["По проверяющим", "Аудитов", "Средняя %"]);
+    Object.entries(byA).forEach(([k, arr]) => filterDesc.push([k, arr.length, Math.round(arr.reduce((s, x) => s + x, 0) / arr.length)]));
+
+    const auditsSheet = [["Дата", "Ресторан", "Проверяющий", "Охват", "Статус", "Итог %", "Нарушений"]];
+    audits.forEach(a => auditsSheet.push([App.fmtDate(a.startedAt), a.restaurant || "—", a.auditorName || "—",
+      a.scope === "all" ? "Все" : App.deptName(a.deptIds[0]), a.status === AUDIT_STATUS.COMPLETED ? "завершён" : "отменён",
+      a.status === AUDIT_STATUS.COMPLETED ? Math.round(a.finalScore == null ? 100 : a.finalScore) : "",
+      vios.filter(v => v.auditId === a.id).length]));
+
+    const auditRest = {}; audits.forEach(a => auditRest[a.id] = a);
+    const viosSheet = [["Дата", "Ресторан", "Подразделение", "Индекс", "Объект", "Тип", "Штраф %", "Комментарий", "Ответственный", "Проверяющий"]];
+    vios.forEach(v => { const a = auditRest[v.auditId] || {}; const cp = cpMap[v.checkpointId] || {};
+      viosSheet.push([App.fmtDate(a.startedAt || v.createdAt), a.restaurant || "—", App.deptName(v.deptId), cp.index || "", cp.object || "",
+        v.severity === SEVERITY.CRITICAL ? "Критично" : "Некритично", v.penaltyPercent, v.comment || "", roleTitle(v.assigneeRole), a.auditorName || ""]); });
+
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, window.XLSX.utils.aoa_to_sheet(filterDesc), "Сводка");
+    window.XLSX.utils.book_append_sheet(wb, window.XLSX.utils.aoa_to_sheet(auditsSheet), "Аудиты");
+    window.XLSX.utils.book_append_sheet(wb, window.XLSX.utils.aoa_to_sheet(viosSheet), "Нарушения");
+    window.XLSX.writeFile(wb, `Статистика_${(f.from || "нач")}_${(f.to || "сег")}.xlsx`.replace(/\s+/g, "_"));
+  }
+};
+
+/* ===================== History detail + analytics chart ===================== */
+const History = {
+  async openItem(id) {
+    const a = await IDB.get("audits_history", id); if (!a) return;
+    Audit.active = a;
+    await Audit._loadData(a.deptIds);
+    Audit.data.violations = await DB.violations(id);
+    App.route("audit_done");
+  },
+  drawChart() {
+    const cv = document.getElementById("trendChart");
+    if (!cv || !window.Chart) return;
+    const t = App.hist.trend;
+    new window.Chart(cv, {
+      type: "line",
+      data: { labels: t.map(x => x.date), datasets: [{ data: t.map(x => x.score), borderColor: "#EA1B24", backgroundColor: "rgba(234,27,36,.08)", fill: true, tension: .35, pointRadius: 3, pointBackgroundColor: "#EA1B24", borderWidth: 2 }] },
+      options: { responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { min: 0, max: 100, ticks: { callback: v => v + "%", color: "#94a3b8" }, grid: { color: "rgba(148,163,184,.15)" } },
+          x: { ticks: { color: "#94a3b8" }, grid: { display: false } } } }
+    });
+  }
+};
+
+/* ===================== Iconography (inline SVG, Lucide-style) ===================== */
+const ICONS = {
+  clipboard: '<rect width="8" height="4" x="8" y="2" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="m9 14 2 2 4-4"/>',
+  chart: '<path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="7" rx="1"/><rect x="12" y="6" width="3" height="11" rx="1"/><rect x="17" y="13" width="3" height="4" rx="1"/>',
+  sliders: '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>',
+  settings: '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+  moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
+  back: '<path d="m15 18-6-6 6-6"/>',
+  backspace: '<path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2Z"/><line x1="18" x2="12" y1="9" y2="15"/><line x1="12" x2="18" y1="9" y2="15"/>',
+  chevron: '<path d="m9 18 6-6-6-6"/>',
+  wrench: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>',
+  mic: '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/>',
+  plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
+  pencil: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>',
+  x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  pause: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>',
+  stop: '<rect x="5" y="5" width="14" height="14" rx="2"/>',
+  alert: '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" x2="12" y1="9" y2="13"/><line x1="12" x2="12.01" y1="17" y2="17"/>',
+  chevronDown: '<path d="m6 9 6 6 6-6"/>',
+  circle: '<circle cx="12" cy="12" r="9"/>',
+  arrow: '<path d="M7 17 17 7"/><path d="M7 7h10v10"/>',
+  undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/>',
+  layers: '<path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/>',
+  store: '<path d="M2 7l1.5-4h17L22 7"/><path d="M4 7v13a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V7"/><path d="M2 7h20"/><path d="M9 21v-6h6v6"/>',
+  file: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+  trend: '<polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  filter: '<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>',
+  calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  inbox: '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+  gauge: '<path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/><circle cx="12" cy="14" r="1.5"/>',
+  share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/>'
+};
+const UI = {
+  icon(name, cls) {
+    return `<svg class="${cls || 'w-6 h-6'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ''}</svg>`;
+  },
+  // Brand logo — official red kept fixed in both themes for brand consistency
+  logo(cls) {
+    return `<svg class="${cls || 'h-8'}" viewBox="0 0 200 122" role="img" aria-label="TANUKI FAMILY" xmlns="http://www.w3.org/2000/svg">
+      <rect x="3" y="3" width="194" height="116" rx="22" fill="#EA1B24"/>
+      <text x="100" y="55" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-weight="800" font-size="38" letter-spacing="0.5" fill="#fff">TANUKI</text>
+      <text x="100" y="100" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-weight="800" font-size="38" letter-spacing="0.5" fill="#fff">FAMILY</text>
+    </svg>`;
+  }
+};
+
+/* ===================== Geo tree helper (Country -> [Region] -> City -> Restaurant) ===================== */
+const Geo = {
+  TYPES: { country: "Страна", region: "Регион", city: "Город", restaurant: "Ресторан" },
+  CHILD: { country: ["region", "city"], region: ["city"], city: ["restaurant"], restaurant: [] },
+  children(list, pid) { return list.filter(n => (n.parentId || null) === (pid || null)); },
+  descendants(list, id) {
+    const out = [];
+    const walk = (pid) => Geo.children(list, pid).forEach(c => { out.push(c); walk(c.id); });
+    walk(id); return out;
+  },
+  // Expands scope node ids to the set of restaurant ids inside their subtrees
+  restaurantsUnder(list, ids) {
+    const set = new Set();
+    (ids || []).forEach(id => {
+      const n = list.find(x => x.id === id);
+      if (!n) return;
+      if (n.type === "restaurant") set.add(n.id);
+      Geo.descendants(list, id).forEach(d => { if (d.type === "restaurant") set.add(d.id); });
+    });
+    return set;
+  }
+};
+
+/* ===================== Violation form state ===================== */
+const VForm = {
+  draft: null, penalties: [], orgRoles: [],
+  async open(deptId, checkpointId) {
+    VForm.penalties = await DB.penalties();
+    VForm.orgRoles = await DB.orgRoles();
+    VForm.newDraft(deptId, checkpointId);
+    App.route("violation");
+  },
+  newDraft(deptId, checkpointId) {
+    const def = VForm.penalties[0] || { id: null, percent: 0 };
+    VForm.draft = {
+      id: "vio_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+      auditId: Audit.active.id, deptId, checkpointId,
+      severity: SEVERITY.NON_CRITICAL, penaltyId: def.id, penaltyPercent: def.percent,
+      assigneeRole: "", comment: "", createdAt: new Date().toISOString(),
+      status: VIO_STATUS.OPEN, dispute: null,
+      photos: [], markers: [], thread: []
+    };
+  },
+  setPenalty(id) { const p = VForm.penalties.find(x => x.id === id); VForm.draft.penaltyId = id; VForm.draft.penaltyPercent = p ? p.percent : 0; },
+  async save(addAnother) {
+    const d = VForm.draft;
+    d.thread = d.comment ? [{ author: THREAD_AUTHOR.AUDITOR, name: App.user.name, text: d.comment, ts: d.createdAt }] : [];
+    await Audit.addViolation(Object.assign({}, d, { photos: d.photos.slice(), markers: d.markers.slice() }));
+    if (addAnother) { VForm.newDraft(d.deptId, d.checkpointId); App.render(); }
+    else App.route("audit_run");
+  }
+};
+
+/* ===================== Photo editor (canvas markers) ===================== */
+const PhotoEdit = {
+  idx: null, tool: "circle", shapes: [], img: null, cv: null, ctx: null, start: null,
+  open(idx) { PhotoEdit.idx = idx; PhotoEdit.tool = "circle"; PhotoEdit.shapes = (VForm.draft.markers[idx] || []).slice(); App.route("photo_edit"); },
+  init() {
+    const cv = document.getElementById("editCanvas"); if (!cv) return;
+    const img = new Image();
+    img.onload = () => {
+      const maxW = cv.parentElement.clientWidth;
+      const scale = Math.min(1, maxW / img.width);
+      cv.width = Math.round(img.width * scale); cv.height = Math.round(img.height * scale);
+      PhotoEdit.img = img; PhotoEdit.cv = cv; PhotoEdit.ctx = cv.getContext("2d"); PhotoEdit.redraw();
+    };
+    img.src = VForm.draft.photos[PhotoEdit.idx];
+    let drawing = false;
+    const pos = (e) => { const r = cv.getBoundingClientRect(); const t = e.touches ? e.touches[0] : e; return { x: t.clientX - r.left, y: t.clientY - r.top }; };
+    const down = (e) => { e.preventDefault(); drawing = true; PhotoEdit.start = pos(e); };
+    const move = (e) => { if (!drawing) return; e.preventDefault(); const p = pos(e); PhotoEdit.redraw(); PhotoEdit._shape(PhotoEdit.start, p); };
+    const up = (e) => { if (!drawing) return; drawing = false; const p = pos(e); const s = PhotoEdit.start;
+      PhotoEdit.shapes.push({ tool: PhotoEdit.tool, x1: s.x / cv.width, y1: s.y / cv.height, x2: p.x / cv.width, y2: p.y / cv.height });
+      PhotoEdit.redraw(); };
+    cv.onmousedown = down; cv.onmousemove = move; window.addEventListener("mouseup", up, { once: false });
+    cv.ontouchstart = down; cv.ontouchmove = move; cv.ontouchend = up;
+    PhotoEdit._up = up;
+  },
+  redraw() { const p = PhotoEdit; if (!p.ctx) return; p.ctx.drawImage(p.img, 0, 0, p.cv.width, p.cv.height); p.shapes.forEach(s => p._draw(s)); },
+  _shape(a, b) { PhotoEdit._draw({ tool: PhotoEdit.tool, x1: a.x / PhotoEdit.cv.width, y1: a.y / PhotoEdit.cv.height, x2: b.x / PhotoEdit.cv.width, y2: b.y / PhotoEdit.cv.height }); },
+  _draw(s) {
+    const { ctx, cv } = PhotoEdit; if (!ctx) return;
+    ctx.strokeStyle = "#EA1B24"; ctx.lineWidth = Math.max(3, cv.width * 0.008); ctx.lineCap = "round"; ctx.lineJoin = "round";
+    const x1 = s.x1 * cv.width, y1 = s.y1 * cv.height, x2 = s.x2 * cv.width, y2 = s.y2 * cv.height;
+    if (s.tool === "circle") {
+      ctx.beginPath(); ctx.ellipse((x1 + x2) / 2, (y1 + y2) / 2, Math.abs(x2 - x1) / 2, Math.abs(y2 - y1) / 2, 0, 0, Math.PI * 2); ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+      const ang = Math.atan2(y2 - y1, x2 - x1), h = Math.max(12, cv.width * 0.035);
+      ctx.beginPath(); ctx.moveTo(x2, y2); ctx.lineTo(x2 - h * Math.cos(ang - 0.4), y2 - h * Math.sin(ang - 0.4));
+      ctx.moveTo(x2, y2); ctx.lineTo(x2 - h * Math.cos(ang + 0.4), y2 - h * Math.sin(ang + 0.4)); ctx.stroke();
+    }
+  },
+  undo() { PhotoEdit.shapes.pop(); PhotoEdit.redraw(); },
+  save() {
+    const img = PhotoEdit.img;
+    const full = document.createElement("canvas"); full.width = img.width; full.height = img.height;
+    const fx = full.getContext("2d"); fx.drawImage(img, 0, 0);
+    const savedCv = PhotoEdit.cv, savedCtx = PhotoEdit.ctx;
+    PhotoEdit.cv = full; PhotoEdit.ctx = fx; PhotoEdit.shapes.forEach(s => PhotoEdit._draw(s));
+    PhotoEdit.cv = savedCv; PhotoEdit.ctx = savedCtx;
+    VForm.draft.photos[PhotoEdit.idx] = full.toDataURL("image/jpeg", 0.7);
+    VForm.draft.markers[PhotoEdit.idx] = PhotoEdit.shapes.slice();
+    App.route("violation");
+  }
+};
+
+/* ===================== Workflow: corrective actions & disputes ===================== */
+const Workflow = {
+  ctx: null, // { auditId, vio, composerPhotos: [] }
+
+  meta(s) {
+    switch (s) {
+      case VIO_STATUS.FIX_SUBMITTED:   return { label: "На проверке", cls: "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400" };
+      case VIO_STATUS.RESOLVED:        return { label: "Исправлено", cls: "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400" };
+      case VIO_STATUS.DISPUTED:        return { label: "Оспаривается", cls: "bg-violet-50 text-violet-700 dark:bg-violet-500/10 dark:text-violet-400" };
+      case VIO_STATUS.DISPUTE_UPHELD:  return { label: "Оспорено (снято)", cls: "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400" };
+      case VIO_STATUS.DISPUTE_REJECTED:return { label: "Оспаривание отклонено", cls: "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400" };
+      default:                         return { label: "Открыто", cls: "bg-brand/10 text-brand" };
+    }
+  },
+  // Rank via position tree depth (0 = top). No position = lowest (Infinity).
+  rankOf(positionId) {
+    if (!positionId) return Infinity;
+    let d = 0, cur = App._positions.find(p => p.id === positionId);
+    const seen = new Set();
+    while (cur && cur.parentId && !seen.has(cur.id)) { seen.add(cur.id); cur = App._positions.find(p => p.id === cur.parentId); d++; }
+    return cur ? d : Infinity;
+  },
+  auditorOf(audit) { return App.users.find(u => u.id === audit.auditorId); },
+  canResolve(audit) {
+    if (!App.can("task.resolve")) return false;
+    const aud = Workflow.auditorOf(audit);
+    // Rank gate: resolver's rank must be >= auditor's rank (same or higher position).
+    return Workflow.rankOf(App.user.positionId) <= Workflow.rankOf(aud ? aud.positionId : null);
+  },
+  // Applicable dispute policy: per-restaurant, else "default", else null (legacy any-approver)
+  getPolicy(audit) {
+    const pol = (App._policies || []);
+    const byRest = pol.find(p => p.id === (audit.restaurantId || "") && (p.approvers || []).length);
+    if (byRest) return byRest;
+    const def = pol.find(p => p.id === "default" && (p.approvers || []).length);
+    return def || null;
+  },
+  // Approver of a dispute: in policy's approver list; else legacy (dispute.approve + scope)
+  isApprover(audit) {
+    if (!App.can("dispute.approve")) return false;
+    const pol = Workflow.getPolicy(audit);
+    if (pol) return pol.approvers.some(a => a.userId === App.user.id);
+    if (!(App.user.scope || []).length) return true;
+    if (!audit.restaurantId) return true;
+    return Geo.restaurantsUnder(App._geo, App.user.scope).has(audit.restaurantId);
+  },
+  // Returns "upheld" | "rejected" | "pending"
+  evaluate(dispute, pol) {
+    const votes = dispute.votes || [];
+    if (!votes.length) return "pending";
+    if (!pol) { const last = votes[votes.length - 1]; return last.approve ? "upheld" : "rejected"; }
+    // Override approver decides unilaterally
+    const overrideIds = new Set(pol.approvers.filter(a => a.canOverride).map(a => a.userId));
+    const ov = votes.find(v => overrideIds.has(v.userId));
+    if (ov) return ov.approve ? "upheld" : "rejected";
+    const wOf = (uid) => { const a = pol.approvers.find(x => x.userId === uid); return a ? (Number(a.weight) || 1) : 0; };
+    const totalW = pol.approvers.reduce((s, a) => s + (Number(a.weight) || 1), 0) || 1;
+    const appW = votes.filter(v => v.approve).reduce((s, v) => s + wOf(v.userId), 0);
+    const rejW = votes.filter(v => !v.approve).reduce((s, v) => s + wOf(v.userId), 0);
+    if (pol.mode === "unanimous") {
+      if (rejW > 0) return "rejected";
+      const approvedCount = pol.approvers.filter(a => votes.some(v => v.userId === a.userId && v.approve)).length;
+      return approvedCount >= pol.approvers.length ? "upheld" : "pending";
+    }
+    const need = ((Number(pol.threshold) || 60) / 100) * totalW;
+    if (appW >= need) return "upheld";
+    if (rejW > totalW - need) return "rejected";
+    return "pending";
+  },
+  policySummary(audit) {
+    const pol = Workflow.getPolicy(audit); if (!pol) return "";
+    const names = (pol.approvers || []).map(a => { const u = App.users.find(x => x.id === a.userId); return (u ? u.name : "?") + (a.canOverride ? "★" : "") + "×" + (a.weight || 1); }).join(", ");
+    const mode = pol.mode === "unanimous" ? "единогласно" : "порог " + (pol.threshold || 60) + "%";
+    return mode + " · " + names;
+  },
+
+  open(auditId, vioId) {
+    const vio = Audit.data.violations.find(v => v.id === vioId);
+    if (!vio) return;
+    if (!vio.status) vio.status = VIO_STATUS.OPEN;
+    Workflow.ctx = { auditId, vio, composerPhotos: [] };
+    App.route("vio_detail");
+  },
+
+  _entry(kind, text) {
+    return { author: (kind === "fix" || kind === "dispute") ? THREAD_AUTHOR.RESTAURANT : THREAD_AUTHOR.AUDITOR,
+      name: App.user.name, role: App.user.position || "", kind, text: text || "",
+      photos: (Workflow.ctx.composerPhotos || []).slice(), ts: new Date().toISOString() };
+  },
+  async _save() {
+    const v = Workflow.ctx.vio;
+    await DB.saveViolation(v);
+    // keep in-memory audit data in sync
+    const i = Audit.data.violations.findIndex(x => x.id === v.id);
+    if (i >= 0) Audit.data.violations[i] = v;
+    await Workflow._recomputeAudit();
+    Sync.enqueue(Workflow.ctx.auditId);
+  },
+  async _recomputeAudit() {
+    // Recompute stored audit score, excluding upheld-dispute violations (penalty removed).
+    const a = await IDB.get("audits_history", Workflow.ctx.auditId);
+    if (!a) return;
+    const scores = {};
+    for (const deptId of a.deptIds) {
+      const cats = await DB.categories(deptId);
+      const struct = await DB.checkpoints(deptId);
+      const vios = Audit.data.violations.filter(v => v.deptId === deptId && v.status !== VIO_STATUS.DISPUTE_UPHELD);
+      const catScores = Scoring.categoryScores(cats, struct, vios);
+      scores[deptId] = { categories: catScores, score: Scoring.deptScore(cats, catScores) };
+    }
+    a.scores = scores;
+    a.finalScore = Scoring.finalScore(Object.fromEntries(a.deptIds.map(d => [d, scores[d].score])));
+    await DB.saveAudit(a);
+    if (Audit.active && Audit.active.id === a.id) Audit.active = a;
+  },
+
+  async submitFix(text) {
+    const v = Workflow.ctx.vio;
+    if (!text.trim() && !(Workflow.ctx.composerPhotos || []).length) { alert("Добавьте комментарий или фото."); return; }
+    v.thread = v.thread || []; v.thread.push(Workflow._entry("fix", text));
+    if (v.status === VIO_STATUS.OPEN || v.status === VIO_STATUS.DISPUTE_REJECTED) v.status = VIO_STATUS.FIX_SUBMITTED;
+    Workflow.ctx.composerPhotos = []; Workflow.ctx.wfText = "";
+    await Workflow._save(); App.render();
+  },
+  async resolve() {
+    const v = Workflow.ctx.vio;
+    v.thread = v.thread || []; v.thread.push({ author: THREAD_AUTHOR.SYSTEM, name: App.user.name, kind: "decision", text: "Исправление принято", photos: [], ts: new Date().toISOString() });
+    v.status = VIO_STATUS.RESOLVED;
+    await Workflow._save(); App.render();
+  },
+  async rejectFix() {
+    const v = Workflow.ctx.vio;
+    v.thread = v.thread || []; v.thread.push({ author: THREAD_AUTHOR.SYSTEM, name: App.user.name, kind: "decision", text: "Исправление отклонено — доработать", photos: [], ts: new Date().toISOString() });
+    v.status = VIO_STATUS.OPEN;
+    await Workflow._save(); App.render();
+  },
+  async raiseDispute(text) {
+    if (!text.trim()) { alert("Опишите причину оспаривания."); return; }
+    const v = Workflow.ctx.vio;
+    v.thread = v.thread || []; v.thread.push(Workflow._entry("dispute", text));
+    v.dispute = { raisedBy: App.user.id, raisedByName: App.user.name, reason: text, ts: new Date().toISOString(), votes: [] };
+    v.status = VIO_STATUS.DISPUTED;
+    Workflow.ctx.composerPhotos = []; Workflow.ctx.wfText = "";
+    await Workflow._save(); App.render();
+  },
+  async voteDispute(approve, comment) {
+    const v = Workflow.ctx.vio;
+    v.dispute = v.dispute || { votes: [] };
+    if (v.dispute.votes.some(x => x.userId === App.user.id)) { alert("Вы уже проголосовали."); return; }
+    v.dispute.votes.push({ userId: App.user.id, name: App.user.name, approve, comment: comment || "", ts: new Date().toISOString() });
+    v.thread = v.thread || []; v.thread.push({ author: THREAD_AUTHOR.SYSTEM, name: App.user.name, kind: "decision",
+      text: (approve ? "Согласовал(а) оспаривание" : "Отклонил(а) оспаривание") + (comment ? ": " + comment : ""), photos: [], ts: new Date().toISOString() });
+    // Evaluate against the applicable policy (weighted / unanimous / threshold / override)
+    const decision = Workflow.evaluate(v.dispute, Workflow.getPolicy(Audit.active));
+    if (decision === "upheld") { v.status = VIO_STATUS.DISPUTE_UPHELD; v.thread.push({ author: THREAD_AUTHOR.SYSTEM, kind: "decision", name: "Система", text: "Оспаривание удовлетворено — нарушение снято, балл восстановлен.", photos: [], ts: new Date().toISOString() }); }
+    else if (decision === "rejected") { v.status = VIO_STATUS.DISPUTE_REJECTED; v.thread.push({ author: THREAD_AUTHOR.SYSTEM, kind: "decision", name: "Система", text: "Оспаривание отклонено — нарушение остаётся в силе.", photos: [], ts: new Date().toISOString() }); }
+    // else: pending — waits for more approvers
+    await Workflow._save(); App.render();
+  }
+};
+
+/* ===================== App controller ===================== */
+const App = {
+  user: null,
+  users: [],
+
+  async boot() {
+    Session.load(); Theme.apply();
+    App.el = document.getElementById("app");
+    App.el.innerHTML = App._splash("Загрузка…");
+    try {
+      await DB.init();
+      App.users = await DB.users();
+      App._roles = await DB.roles();
+      App._geo = await DB.geoNodes();
+      App._positions = await DB.positions();
+      App._orgRoles = await DB.orgRoles();
+      App._policies = await DB.policies();
+      App._access = await DB.access();
+      if (Session.data.userId) App.user = App.users.find(u => u.id === Session.data.userId) || null;
+      App.route(App.user ? (Session.data.route === "login" ? "home" : Session.data.route) : "login");
+    } catch (e) {
+      App.el.innerHTML = App._splash("Ошибка инициализации: " + e.message);
+    }
+    document.addEventListener("click", App._onClick);
+    document.addEventListener("change", App._onChange);
+    document.addEventListener("input", App._onInput);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && Session.data.route === "login" && Auth.step === "login") Auth.next();
+    });
+    window.addEventListener("online",  () => { App._setSync(true); Sync.flush(); });
+    window.addEventListener("offline", () => App._setSync(false));
+    Sync.flush();
+  },
+
+  route(name) { if (Voice.active && name !== "violation") Voice.stop(); Session.set({ route: name }); App.render(); },
+  render() {
+    const r = Session.data.route;
+    const screen = App.screens[r] || App.screens.home;
+    App.el.innerHTML = screen();
+    if (App._after) { const f = App._after; App._after = null; f(); }
+    Theme.apply();
+    App._refreshSync();
+  },
+
+  _syncOk: null,
+  _syncLast: 0,
+  async _refreshSync(force) {
+    const now = Date.now();
+    if (!force && now - App._syncLast < 10000) return;
+    App._syncLast = now;
+    const ok = await Sync.ping();
+    App._setSync(ok);
+  },
+
+  setup: { departments: [], resumable: [], scope: "single", selDept: null },
+
+  _onClick(e) {
+    const t = e.target.closest("[data-action],[data-route],[data-pin]");
+    if (!t) return;
+    const d = t.dataset;
+    if (d.pin != null) { Auth.pinPress(d.pin); return; }
+    const a = d.action;
+    switch (a) {
+      case "theme":  Theme.toggle(); return;
+      case "logout": Session.clear(); App.user = null; Auth.reset(); App.route("login"); return;
+      case "auth-next": Auth.next(); return;
+      case "auth-back": Auth.back(); return;
+      case "new-audit": App.openAuditSetup(); return;
+      case "set-scope": App.setup.scope = d.val; App.render(); return;
+      case "sel-dept": App.setup.selDept = d.dept; App.render(); return;
+      case "start-audit": App.doStartAudit(); return;
+      case "resume-audit": Audit.resume(d.id); return;
+      case "switch-dept": Audit.ui.deptId = d.dept; Audit.ui.openCat = null; App.render(); return;
+      case "toggle-cat": Audit.ui.openCat = (Audit.ui.openCat === d.cat ? null : d.cat); App.render(); return;
+      case "open-cp": VForm.open(d.dept, d.cp); return;
+      case "del-vio": if (confirm("Удалить это нарушение?")) Audit.removeViolation(d.id).then(() => App.render()); return;
+      case "audit-pause": Audit.pause(); return;
+      case "audit-finish": if (confirm("Завершить аудит и сформировать результат?")) Audit.finish(); return;
+      case "audit-abort": if (confirm("Прекратить аудит? Он будет помечен как отменённый.")) Audit.abort(); return;
+      case "export-pdf":   Reports.exportPDF(); return;
+      case "export-excel": Reports.exportExcel(); return;
+      case "export-html":  Reports.exportHTML(); return;
+      case "share-open": App.openShare(d.id); return;
+      case "share-save": App.saveShare(); return;
+      case "history": App.openHistory(); return;
+      case "dashboard": App.openDashboard(); return;
+      case "wf-open-ctx": App.openVioFrom(d.audit, d.vio); return;
+      case "open-history-item": History.openItem(d.id); return;
+      case "del-audit": App.deleteAudit(d.id); return;
+      case "hist-filter-toggle": App.histFilterOpen = !App.histFilterOpen; App.render(); return;
+      case "hist-reset": App.resetHistFilter(); return;
+      case "hist-export": Reports.exportPeriod(); return;
+      // admin: users & roles
+      case "adm-user-new": App.admUserNew(); return;
+      case "adm-user-edit": App.admUserEdit(d.id); return;
+      case "adm-user-save": App.admUserSave(); return;
+      case "adm-user-del": App.admUserDel(d.id); return;
+      case "adm-user-photo": { const el = document.getElementById("uPhotoInput"); if (el) el.click(); return; }
+      case "adm-user-photo-del": App.adm.uDraft.photo = null; App.render(); return;
+      case "adm-role-new": App.admRoleNew(); return;
+      case "adm-role-edit": App.admRoleEdit(d.id); return;
+      case "adm-role-save": App.admRoleSave(); return;
+      case "adm-role-del": App.admRoleDel(d.id); return;
+      // admin: geo & positions
+      case "geo-add": App.geoAdd(d.parent || null, d.type); return;
+      case "geo-del": App.geoDel(d.id); return;
+      case "pos-add": App.posAdd(d.parent || null); return;
+      case "pos-del": App.posDel(d.id); return;
+      case "pol-list": App.route("policies"); return;
+      case "pol-edit": App.admPolicyEdit(d.id); return;
+      case "pol-save": App.admPolicySave(); return;
+      case "pol-mode": App.adm.pDraft.mode = d.val; App.render(); return;
+      // violation form
+      case "vform-cancel": App.route("audit_run"); return;
+      case "vform-severity": VForm.draft.severity = d.val; App.render(); return;
+      case "vform-add-photo": { const el = document.getElementById("photoInput"); if (el) el.click(); return; }
+      case "vform-remove-photo": VForm.draft.photos.splice(+d.idx, 1); VForm.draft.markers.splice(+d.idx, 1); App.render(); return;
+      case "vform-edit-photo": PhotoEdit.open(+d.idx); return;
+      case "vform-voice": App.toggleVoice(); return;
+      case "vform-save": VForm.save(false); return;
+      case "vform-save-add": VForm.save(true); return;
+      // workflow (corrective / dispute)
+      case "wf-open": Workflow.open(Audit.active.id, d.id); return;
+      case "wf-add-photo": { const el = document.getElementById("wfPhotoInput"); if (el) el.click(); return; }
+      case "wf-photo-del": Workflow.ctx.composerPhotos.splice(+d.idx, 1); App.render(); return;
+      case "wf-fix": Workflow.submitFix(Workflow.ctx.wfText || (document.getElementById("wfText") || {}).value || ""); return;
+      case "wf-dispute": Workflow.raiseDispute(Workflow.ctx.wfText || (document.getElementById("wfText") || {}).value || ""); return;
+      case "wf-resolve": Workflow.resolve(); return;
+      case "wf-reject": Workflow.rejectFix(); return;
+      case "wf-vote-approve": Workflow.voteDispute(true, ""); return;
+      case "wf-vote-reject": Workflow.voteDispute(false, ""); return;
+      // photo editor
+      case "pe-tool": PhotoEdit.tool = d.val; App.render(); return;
+      case "pe-undo": PhotoEdit.undo(); return;
+      case "pe-save": PhotoEdit.save(); return;
+      case "pe-cancel": App.route("violation"); return;
+    }
+    if (d.route) App.route(d.route);
+  },
+
+  _onChange(e) {
+    const el = e.target; const d = el.dataset || {};
+    if (el.id === "photoInput") { App.handlePhotos(el.files); return; }
+    if (el.id === "uPhotoInput") { App.admUserPhoto(el.files); return; }
+    if (el.id === "wfPhotoInput") { App.handleWfPhotos(el.files); return; }
+    if (d.field === "setup-restaurant") { App.setup.restaurantId = el.value; return; }
+    if (d.field && d.field.indexOf("hf-") === 0) {
+      const map = { "hf-from": "from", "hf-to": "to", "hf-auditor": "auditorId", "hf-restaurant": "restaurantId", "hf-dept": "deptId", "hf-assignee": "assignee" };
+      App.histFilter[map[d.field]] = el.value; App.applyHistFilter(true); return;
+    }
+    if (d.field === "penalty")  { VForm.setPenalty(el.value); App.render(); return; }
+    if (d.field === "assignee") { VForm.draft.assigneeRole = el.value; return; }
+    if (d.field === "u-role") {
+      const set = new Set(App.adm.uDraft.roleIds || []);
+      el.checked ? set.add(el.value) : set.delete(el.value);
+      App.adm.uDraft.roleIds = Array.from(set); return;
+    }
+    if (d.field === "u-active") { App.adm.uDraft.active = el.checked; return; }
+    if (d.field === "share-user") { App.toggleShareUser(el.value, el.checked); return; }
+    if (d.field === "u-positionId") {
+      const p = App._positions.find(x => x.id === el.value);
+      App.adm.uDraft.positionId = el.value || null;
+      App.adm.uDraft.position = p ? p.title : ""; return;
+    }
+    if (d.field === "u-scope") {
+      const set = new Set(App.adm.uDraft.scope || []);
+      el.checked ? set.add(el.value) : set.delete(el.value);
+      App.adm.uDraft.scope = Array.from(set); return;
+    }
+    if (d.field === "r-perm") {
+      const r = App.adm.rDraft;
+      let set = new Set((r.permissions || []).filter(p => p !== "*"));
+      el.checked ? set.add(el.value) : set.delete(el.value);
+      r.permissions = Array.from(set); return;
+    }
+    if (d.field === "pol-approver") { App._polApprover(el.value, el.checked); return; }
+    if (d.field === "pol-override") { App._polField(el.dataset.uid, "canOverride", el.checked); return; }
+    if (d.field === "pol-threshold") { App.adm.pDraft.threshold = Number(el.value); App.render(); return; }
+  },
+  _onInput(e) {
+    const el = e.target; const d = el.dataset || {};
+    if (d.field === "comment") { VForm.draft.comment = el.value; return; }
+    if (d.field === "wf-text") { Workflow.ctx.wfText = el.value; return; }
+    if (d.field === "auth-login") { Auth.loginVal = el.value; return; }
+    if (d.field === "u-name")     { App.adm.uDraft.name = el.value; return; }
+    if (d.field === "u-login")    { App.adm.uDraft.login = el.value; return; }
+    if (d.field === "u-position") { App.adm.uDraft.position = el.value; return; }
+    if (d.field === "u-pin")      { el.value = el.value.replace(/\D/g, "").slice(0, 6); App.adm.uDraft.pin = el.value; return; }
+    if (d.field === "r-name")     { App.adm.rDraft.name = el.value; return; }
+    if (d.field === "pol-weight") { App._polField(el.dataset.uid, "weight", Math.max(1, Number(el.value) || 1)); return; }
+  },
+
+  async handlePhotos(files) {
+    for (const f of Array.from(files)) {
+      try { const dataUrl = await Media.compress(f); VForm.draft.photos.push(dataUrl); VForm.draft.markers.push([]); }
+      catch (err) { /* skip unreadable file */ }
+    }
+    App.render();
+  },
+  async handleWfPhotos(files) {
+    Workflow.ctx.composerPhotos = Workflow.ctx.composerPhotos || [];
+    for (const f of Array.from(files)) {
+      try { Workflow.ctx.composerPhotos.push(await Media.compress(f, 1024, 0.7)); } catch (e) {}
+    }
+    App.render();
+  },
+
+  toggleVoice() {
+    if (!Voice.supported()) { alert("Голосовой ввод не поддерживается этим браузером."); return; }
+    const ok = Voice.toggle(
+      (text) => { VForm.draft.comment = text; const ta = document.getElementById("vComment"); if (ta) ta.value = text; },
+      () => App.render()
+    );
+    App.render();
+    return ok;
+  },
+
+  async openAuditSetup() {
+    if (!App.can("audit.conduct")) { App.route("home"); return; }
+    const deps = await DB.departments();
+    for (const dep of deps) dep._count = (await DB.categories(dep.id)).length;
+    const audits = await DB.audits();
+    App.setup.departments = deps;
+    App.setup.resumable = audits
+      .filter(a => a.status === AUDIT_STATUS.IN_PROGRESS || a.status === AUDIT_STATUS.PAUSED)
+      .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
+    App.setup.scope = "single"; App.setup.selDept = null;
+    // Restaurants available to this auditor (scope-limited unless empty scope)
+    App._geo = await DB.geoNodes();
+    let rests = App._geo.filter(n => n.type === "restaurant");
+    if ((App.user.scope || []).length) {
+      const allowed = Geo.restaurantsUnder(App._geo, App.user.scope);
+      rests = rests.filter(r => allowed.has(r.id));
+    }
+    App.setup.restaurants = rests;
+    App.setup.restaurantId = rests.length === 1 ? rests[0].id : "";
+    App.route("audit_setup");
+  },
+  doStartAudit() {
+    const s = App.setup;
+    let deptIds;
+    if (s.scope === "all") deptIds = s.departments.filter(d => d._count > 0).map(d => d.id);
+    else deptIds = s.selDept ? [s.selDept] : [];
+    if (!deptIds.length) { alert("Выберите подразделение с чек-листом."); return; }
+    if ((s.restaurants || []).length && !s.restaurantId) { alert("Выберите ресторан."); return; }
+    Audit.start(s.scope, deptIds);
+  },
+
+  hist: { audits: [], top: [], trend: [], total: 0 },
+  histRaw: { audits: [], vios: [], cpMap: {} },
+  histFilter: { from: "", to: "", auditorId: "", restaurantId: "", deptId: "", assignee: "" },
+
+  async openHistory() {
+    let audits = (await DB.audits())
+      .filter(a => a.status === AUDIT_STATUS.COMPLETED || a.status === AUDIT_STATUS.ABORTED)
+      .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
+    audits = App.visibleAudits(audits); // viewAll / scope-subtree+own / own+shared
+    const idset = new Set(audits.map(a => a.id));
+    const allVios = (await IDB.getAll("audit_violations")).filter(v => idset.has(v.auditId));
+    const cpMap = {}; (await IDB.getAll("checklist_structure")).forEach(c => cpMap[c.id] = c);
+    App.histRaw = { audits, vios: allVios, cpMap };
+    App.histFilter = { from: "", to: "", auditorId: "", restaurantId: "", deptId: "", assignee: "" };
+    App.applyHistFilter(false);
+    App.route("history");
+  },
+
+  filteredHistory() {
+    const f = App.histFilter;
+    const fromT = f.from ? new Date(f.from + "T00:00:00").getTime() : -Infinity;
+    const toT   = f.to ? new Date(f.to + "T23:59:59").getTime() : Infinity;
+    let audits = App.histRaw.audits.filter(a => {
+      const t = new Date(a.startedAt).getTime();
+      if (t < fromT || t > toT) return false;
+      if (f.auditorId && a.auditorId !== f.auditorId) return false;
+      if (f.restaurantId && a.restaurantId !== f.restaurantId) return false;
+      if (f.deptId && !(a.deptIds || []).includes(f.deptId)) return false;
+      return true;
+    });
+    let vios = App.histRaw.vios;
+    if (f.deptId) vios = vios.filter(v => v.deptId === f.deptId);
+    if (f.assignee) {
+      vios = vios.filter(v => v.assigneeRole === f.assignee);
+      const withAssignee = new Set(vios.map(v => v.auditId));
+      audits = audits.filter(a => withAssignee.has(a.id));
+    }
+    const auditIds = new Set(audits.map(a => a.id));
+    vios = vios.filter(v => auditIds.has(v.auditId));
+    return { audits, vios };
+  },
+  applyHistFilter(rerender) {
+    const { audits, vios } = App.filteredHistory();
+    const cpMap = App.histRaw.cpMap;
+    const counts = {};
+    vios.forEach(v => { const o = (cpMap[v.checkpointId] || {}).object || "—"; counts[o] = (counts[o] || 0) + 1; });
+    const top = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => ({ name, count }));
+    const completed = audits.filter(a => a.status === AUDIT_STATUS.COMPLETED);
+    const trend = completed.slice(0, 12).reverse()
+      .map(a => ({ date: new Date(a.startedAt).toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" }), score: Math.round(a.finalScore == null ? 100 : a.finalScore) }));
+    const avg = completed.length ? Math.round(completed.reduce((s, a) => s + (a.finalScore == null ? 100 : a.finalScore), 0) / completed.length) : null;
+    App.hist = { audits, top, trend, total: vios.length, avg, vios };
+    if (rerender) App.render();
+  },
+  histActiveFilters() {
+    const f = App.histFilter;
+    return [f.from, f.to, f.auditorId, f.restaurantId, f.deptId, f.assignee].filter(Boolean).length;
+  },
+  resetHistFilter() { App.histFilter = { from: "", to: "", auditorId: "", restaurantId: "", deptId: "", assignee: "" }; App.applyHistFilter(true); },
+
+  // Shared scope filter used by History + Dashboard
+  visibleAudits(audits) {
+    const perms = App.myPerms();
+    if (perms.has("*") || perms.has("audit.viewAll")) return audits;
+    if (perms.has("audit.viewScope") && (App.user.scope || []).length) {
+      const allowed = Geo.restaurantsUnder(App._geo, App.user.scope);
+      return audits.filter(a => a.auditorId === App.user.id || (a.restaurantId && allowed.has(a.restaurantId)) || (App._access || []).some(g => g.auditId === a.id && g.userId === App.user.id));
+    }
+    return audits.filter(a => a.auditorId === App.user.id || (App._access || []).some(g => g.auditId === a.id && g.userId === App.user.id));
+  },
+
+  dash: { avg: null, count: 0, resolveQueue: [], voteQueue: [], attention: [], recent: [] },
+  async openDashboard() {
+    let audits = (await DB.audits()).filter(a => a.status === AUDIT_STATUS.COMPLETED);
+    audits = App.visibleAudits(audits).sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
+    const byId = {}; audits.forEach(a => byId[a.id] = a);
+    const idset = new Set(audits.map(a => a.id));
+    const vios = (await IDB.getAll("audit_violations")).filter(v => idset.has(v.auditId));
+    const cpMap = {}; (await IDB.getAll("checklist_structure")).forEach(c => cpMap[c.id] = c);
+    const resolveQueue = [], voteQueue = [];
+    vios.forEach(v => {
+      const a = byId[v.auditId]; if (!a) return;
+      if (v.status === VIO_STATUS.FIX_SUBMITTED && Workflow.canResolve(a)) resolveQueue.push({ v, a, cp: cpMap[v.checkpointId] || {} });
+      if (v.status === VIO_STATUS.DISPUTED && Workflow.isApprover(a) && !((v.dispute && v.dispute.votes) || []).some(x => x.userId === App.user.id)) voteQueue.push({ v, a, cp: cpMap[v.checkpointId] || {} });
+    });
+    const counts = {};
+    vios.filter(v => v.status !== VIO_STATUS.DISPUTE_UPHELD).forEach(v => { const o = (cpMap[v.checkpointId] || {}).object || "—"; counts[o] = (counts[o] || 0) + 1; });
+    const attention = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name, count]) => ({ name, count }));
+    const avg = audits.length ? Math.round(audits.reduce((s, a) => s + (a.finalScore == null ? 100 : a.finalScore), 0) / audits.length) : null;
+    App.dash = { avg, count: audits.length, resolveQueue, voteQueue, attention, recent: audits.slice(0, 5) };
+    App.route("dashboard");
+  },
+  async openVioFrom(auditId, vioId) {
+    await History.openItem(auditId); // loads Audit context
+    Workflow.open(auditId, vioId);
+  },
+
+  shr: { auditId: null, granted: [] },
+  openShare(auditId) {
+    const granted = (App._access || []).filter(g => g.auditId === auditId).map(g => g.userId);
+    App.shr = { auditId, granted };
+    App.route("share");
+  },
+  toggleShareUser(uid, on) {
+    const set = new Set(App.shr.granted);
+    on ? set.add(uid) : set.delete(uid);
+    App.shr.granted = Array.from(set);
+  },
+  async saveShare() {
+    const { auditId, granted } = App.shr;
+    const existing = (App._access || []).filter(g => g.auditId === auditId);
+    const grantedSet = new Set(granted);
+    // remove revoked
+    for (const g of existing) if (!grantedSet.has(g.userId)) await DB.delAccess(g.id);
+    // add new
+    const existSet = new Set(existing.map(g => g.userId));
+    for (const uid of granted) if (!existSet.has(uid)) await DB.saveAccess({ id: "acc_" + auditId + "_" + uid, auditId, userId: uid, grantedBy: App.user.id, ts: new Date().toISOString() });
+    App._access = await DB.access();
+    App.route("audit_done");
+  },
+
+  async deleteAudit(id) {
+    if (!App.can("audit.delete")) return;
+    if (!confirm("Удалить аудит безвозвратно? Отчёт и все нарушения будут удалены.")) return;
+    const vios = await DB.violations(id);
+    for (const v of vios) await IDB.del("audit_violations", v.id);
+    await IDB.del("audits_history", id);
+    await Sync.dequeue(id);
+    await App.openHistory();
+  },
+
+  /* ---- admin: users & roles CRUD ---- */
+  adm: { uDraft: null, rDraft: null },
+  admUserNew() {
+    App.adm.uDraft = { id: "u_" + Date.now(), name: "", login: "", position: "", pin: "", roleIds: [], scope: [], photo: null, active: true };
+    App.route("user_edit");
+  },
+  admUserEdit(id) {
+    const u = App.users.find(x => x.id === id); if (!u) return;
+    App.adm.uDraft = JSON.parse(JSON.stringify(u));
+    App.route("user_edit");
+  },
+  async admUserSave() {
+    const d = App.adm.uDraft;
+    d.name = (d.name || "").trim(); d.login = (d.login || "").trim().toLowerCase(); d.position = (d.position || "").trim();
+    if (!d.name || !d.login) { alert("Заполните ФИО и логин."); return; }
+    if (!/^\d{4,6}$/.test(d.pin || "")) { alert("PIN — от 4 до 6 цифр."); return; }
+    if (App.users.some(u => u.id !== d.id && (u.login || "").toLowerCase() === d.login)) { alert("Такой логин уже занят."); return; }
+    if (!(d.roleIds || []).length) { alert("Выберите хотя бы одну роль."); return; }
+    await DB.saveUser(d);
+    App.users = await DB.users();
+    if (App.user && App.user.id === d.id) App.user = App.users.find(u => u.id === d.id);
+    App.route("settings");
+  },
+  async admUserDel(id) {
+    if (App.user && id === App.user.id) return;
+    if (!confirm("Удалить пользователя? Его аудиты останутся в истории.")) return;
+    await DB.delUser(id);
+    App.users = await DB.users();
+    App.route("settings");
+  },
+  admRoleNew() {
+    App.adm.rDraft = { id: "role_" + Date.now(), name: "", system: false, permissions: [] };
+    App.route("role_edit");
+  },
+  admRoleEdit(id) {
+    const r = App._roles.find(x => x.id === id); if (!r) return;
+    App.adm.rDraft = JSON.parse(JSON.stringify(r));
+    App.route("role_edit");
+  },
+  async admRoleSave() {
+    const d = App.adm.rDraft;
+    d.name = (d.name || "").trim();
+    if (!d.name) { alert("Введите название роли."); return; }
+    if (!(d.permissions || []).length) { alert("Отметьте хотя бы одно право."); return; }
+    await DB.saveRole(d);
+    App._roles = await DB.roles();
+    App.route("settings");
+  },
+  async admRoleDel(id) {
+    if (App.users.some(u => (u.roleIds || []).includes(id))) return;
+    if (!confirm("Удалить роль?")) return;
+    await DB.delRole(id);
+    App._roles = await DB.roles();
+    App.route("settings");
+  },
+  async admUserPhoto(files) {
+    if (!files || !files[0]) return;
+    try { App.adm.uDraft.photo = await Media.compress(files[0], 256, 0.75); App.render(); }
+    catch (e) { alert("Не удалось загрузить фото."); }
+  },
+
+  /* ---- admin: geo & positions CRUD ---- */
+  _geo: [], _positions: [], _orgRoles: [], _policies: [], _access: [], histFilterOpen: false,
+  async geoAdd(parentId, type) {
+    const name = (prompt("Название (" + Geo.TYPES[type] + "):") || "").trim();
+    if (!name) return;
+    await DB.saveGeo({ id: "geo_" + Date.now(), type, name, parentId: parentId || null });
+    App._geo = await DB.geoNodes(); App.render();
+  },
+  async geoDel(id) {
+    if (Geo.children(App._geo, id).length) { alert("Сначала удалите вложенные элементы."); return; }
+    if (App.users.some(u => (u.scope || []).includes(id))) { alert("Элемент используется в доступах пользователей."); return; }
+    if (!confirm("Удалить элемент географии?")) return;
+    await DB.delGeo(id); App._geo = await DB.geoNodes(); App.render();
+  },
+  async posAdd(parentId) {
+    const title = (prompt("Название должности:") || "").trim();
+    if (!title) return;
+    await DB.savePosition({ id: "pos_" + Date.now(), title, parentId: parentId || null });
+    App._positions = await DB.positions(); App.render();
+  },
+  async posDel(id) {
+    if (App._positions.some(p => p.parentId === id)) { alert("Сначала удалите подчинённые должности."); return; }
+    if (App.users.some(u => u.positionId === id)) { alert("Должность назначена пользователям."); return; }
+    if (!confirm("Удалить должность?")) return;
+    await DB.delPosition(id); App._positions = await DB.positions(); App.render();
+  },
+
+  /* ---- admin: dispute policies ---- */
+  admPolicyEdit(id) {
+    const ex = (App._policies || []).find(p => p.id === id);
+    App.adm.pDraft = ex ? JSON.parse(JSON.stringify(ex)) : { id, mode: "unanimous", threshold: 60, approvers: [] };
+    App.route("policy_edit");
+  },
+  async admPolicySave() {
+    const d = App.adm.pDraft;
+    if ((d.approvers || []).length) await DB.savePolicy(d);
+    else await DB.delPolicy(d.id).catch(() => {}); // empty = remove policy
+    App._policies = await DB.policies();
+    App.route("policies");
+  },
+  _polApprover(uid, on) {
+    const d = App.adm.pDraft; d.approvers = d.approvers || [];
+    if (on) { if (!d.approvers.some(a => a.userId === uid)) d.approvers.push({ userId: uid, weight: 1, canOverride: false }); }
+    else d.approvers = d.approvers.filter(a => a.userId !== uid);
+    App.render();
+  },
+  _polField(uid, field, val) {
+    const a = (App.adm.pDraft.approvers || []).find(x => x.userId === uid);
+    if (a) a[field] = val;
+  },
+
+  // score -> tailwind text/bg color classes
+  scoreColor(p) {
+    if (p >= 90) return "text-emerald-600 dark:text-emerald-400";
+    if (p >= 75) return "text-amber-600 dark:text-amber-400";
+    return "text-brand";
+  },
+  fmtTime(iso) { const d = new Date(iso); return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" }); },
+  fmtDate(iso) { const d = new Date(iso); return d.toLocaleDateString("ru-RU") + " " + d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }); },
+
+  _roles: [],
+  myPerms() {
+    if (!App.user) return new Set();
+    const set = new Set();
+    (App._roles || []).filter(r => (App.user.roleIds || []).includes(r.id))
+      .forEach(r => (r.permissions || []).forEach(p => set.add(p)));
+    return set;
+  },
+  can(perm) { const s = App.myPerms(); return s.has("*") || s.has(perm); },
+  isAdmin() { return App.can("users.manage") || App.can("roles.manage"); },
+  userRoleNames(u) {
+    return (App._roles || []).filter(r => (u.roleIds || []).includes(r.id)).map(r => r.name).join(", ") || "—";
+  },
+
+  /* ---- shared UI ---- */
+  _splash(msg) {
+    return `<div class="min-h-dvh flex items-center justify-center">
+      <div class="text-center">${UI.logo("h-12 mx-auto mb-4")}
+        <div class="text-sm text-slate-500 dark:text-slate-400">${msg}</div></div></div>`;
+  },
+  _setSync(ok) {
+    Sync.online = ok; App._syncOk = ok;
+    const b = document.getElementById("syncBadge");
+    if (!b) return;
+    b.className = "inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full " +
+      (ok ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
+          : "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400");
+    b.innerHTML = `<span class="w-1.5 h-1.5 rounded-full ${ok ? "bg-emerald-500" : "bg-slate-400"}"></span>${ok ? "Онлайн" : "Офлайн"}`;
+  },
+  _badge() {
+    const ok = App._syncOk;
+    const cls = ok === null ? "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400"
+      : ok ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
+           : "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400";
+    const dot = ok ? "bg-emerald-500" : "bg-slate-400";
+    const label = ok === null ? "…" : ok ? "Онлайн" : "Офлайн";
+    return `<span id="syncBadge" class="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full ${cls}"><span class="w-1.5 h-1.5 rounded-full ${dot}"></span>${label}</span>`;
+  },
+  appBar(title, opts) {
+    opts = opts || {};
+    const left = opts.back
+      ? `<button data-route="${opts.back}" aria-label="Назад" class="tnk-press -ml-1 w-10 h-10 grid place-items-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800">${UI.icon("back", "w-5 h-5")}</button>`
+      : UI.logo("h-7");
+    return `<header class="sticky top-0 z-20 bg-white/80 dark:bg-[#0B1120]/80 backdrop-blur-md border-b border-slate-200/70 dark:border-slate-800">
+      <div class="max-w-3xl mx-auto flex items-center gap-3 px-4 h-14">
+        ${left}
+        <h1 class="font-semibold text-[15px] flex-1 truncate ${opts.back ? "" : "sr-only"}">${title}</h1>
+        ${App._badge()}
+        <button data-action="theme" aria-label="Сменить тему" class="tnk-press w-10 h-10 grid place-items-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">${UI.icon(Session.data.theme === "dark" ? "sun" : "moon", "w-5 h-5")}</button>
+      </div></header>`;
+  },
+  tile(target, icon, label, sub, asAction) {
+    const attr = asAction ? `data-action="${target}"` : `data-route="${target}"`;
+    return `<button ${attr} class="tnk-press tnk-tile group text-left p-5 rounded-3xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 hover:border-brand/40 dark:hover:border-brand/40 shadow-[0_1px_2px_rgba(15,23,42,.04)]">
+      <div class="w-11 h-11 grid place-items-center rounded-2xl bg-brand/10 text-brand mb-4">${UI.icon(icon, "w-6 h-6")}</div>
+      <div class="font-semibold text-[17px] tracking-tight">${label}</div>
+      <div class="text-[13px] leading-snug text-slate-500 dark:text-slate-400 mt-0.5">${sub}</div></button>`;
+  },
+  deptName(id) {
+    const src = (App.setup.departments && App.setup.departments.length) ? App.setup.departments : SEED.departments;
+    const d = src.find(x => x.id === id); return d ? d.name : id;
+  },
+  stub(title, note) {
+    return App.appBar(title, { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6">
+      <div class="px-6 py-14 rounded-3xl border border-dashed border-slate-300 dark:border-slate-700 text-center">
+        <div class="w-12 h-12 mx-auto grid place-items-center rounded-2xl bg-slate-100 dark:bg-slate-800 text-slate-400 mb-4">${UI.icon("wrench", "w-6 h-6")}</div>
+        <div class="font-semibold">${title}</div>
+        <div class="text-sm text-slate-500 dark:text-slate-400 mt-1">${note}</div></div></main>`;
+  },
+
+  /* ---- screens ---- */
+  screens: {
+    login()  { return Auth.screen(); },
+    home()   {
+      const u = App.user || {};
+      const initials = (u.name || "?").split(" ").map(s => s[0]).slice(0, 2).join("").toUpperCase();
+      const avatar = u.photo
+        ? `<img src="${u.photo}" alt="" class="w-11 h-11 shrink-0 rounded-full object-cover">`
+        : `<div class="w-11 h-11 shrink-0 grid place-items-center rounded-full bg-brand text-white font-semibold text-sm">${initials}</div>`;
+      return App.appBar("TanukiFamily · Аудит") + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-6">
+        <section class="flex items-center gap-3">
+          ${avatar}
+          <div class="flex-1 min-w-0">
+            <div class="font-semibold leading-tight truncate">${Reports._esc(u.name || "")}</div>
+            <div class="text-[13px] text-slate-500 dark:text-slate-400 truncate">${Reports._esc(u.position || App.userRoleNames(u))}</div>
+          </div>
+          <button data-action="logout" aria-label="Выйти" class="tnk-press inline-flex items-center gap-1.5 text-[13px] font-medium px-3 h-9 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">${UI.icon("logout", "w-4 h-4")}<span>Выйти</span></button>
+        </section>
+        <section>
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Действия</h2>
+          <div class="grid grid-cols-2 gap-3">
+            ${App.can("analytics.view") ? App.tile("dashboard", "gauge", "Дашборд", "Статистика и задачи", true) : ""}
+            ${App.can("audit.conduct") ? App.tile("new-audit", "clipboard", "Новый аудит", "По подразделению или всем", true) : ""}
+            ${App.tile("history", "chart", "История", "Проверки и тренды", true)}
+            ${App.can("checklist.edit") ? App.tile("constructor", "sliders", "Конструктор", "Чек-листы, веса, штрафы") : ""}
+            ${App.isAdmin() ? App.tile("settings", "users", "Настройки", "Пользователи, роли, доступы") : ""}
+          </div>
+        </section></main>`;
+    },
+    audit_setup() {
+      const s = App.setup;
+      const resumable = s.resumable.length ? `<section class="mb-6">
+        <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Незавершённые</h2>
+        <div class="space-y-2">${s.resumable.map(a => `
+          <button data-action="resume-audit" data-id="${a.id}" class="tnk-press w-full flex items-center gap-3 p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+            <div class="w-9 h-9 grid place-items-center rounded-xl ${a.status === AUDIT_STATUS.PAUSED ? "bg-amber-500/10 text-amber-500" : "bg-brand/10 text-brand"}">${UI.icon(a.status === AUDIT_STATUS.PAUSED ? "pause" : "clipboard", "w-5 h-5")}</div>
+            <div class="flex-1 min-w-0"><div class="font-medium text-sm truncate">${a.scope === "all" ? "Все подразделения" : App.deptName(a.deptIds[0])}</div>
+              <div class="text-xs text-slate-500">${App.fmtDate(a.startedAt)} · ${a.status === AUDIT_STATUS.PAUSED ? "на паузе" : "в процессе"}</div></div>
+            ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`).join("")}</div></section>` : "";
+      const scopeCard = (val, icon, title, sub) => `<button data-action="set-scope" data-val="${val}" class="tnk-press flex-1 p-4 rounded-2xl border text-left ${s.scope === val ? "border-brand bg-brand/5" : "border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900"}">
+        <div class="w-9 h-9 grid place-items-center rounded-xl ${s.scope === val ? "bg-brand text-white" : "bg-slate-100 dark:bg-slate-800 text-slate-500"} mb-2">${UI.icon(icon, "w-5 h-5")}</div>
+        <div class="font-semibold text-sm">${title}</div><div class="text-xs text-slate-500">${sub}</div></button>`;
+      const deptList = s.scope === "single"
+        ? `<section class="mt-5"><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Подразделение</h2>
+          <div class="space-y-2">${s.departments.map(dep => {
+            const has = dep._count > 0, sel = s.selDept === dep.id;
+            return `<button ${has ? `data-action="sel-dept" data-dept="${dep.id}"` : "disabled"} class="tnk-press w-full flex items-center gap-3 p-4 rounded-2xl border text-left ${has ? (sel ? "border-brand bg-brand/5" : "border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900") : "opacity-50 border-slate-200 dark:border-slate-800"}">
+              <div class="w-9 h-9 grid place-items-center rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500">${UI.icon("store", "w-5 h-5")}</div>
+              <div class="flex-1"><div class="font-medium text-sm">${dep.name}</div><div class="text-xs text-slate-500">${has ? dep._count + " категорий" : "нет чек-листа"}</div></div>
+              ${sel ? UI.icon("check", "w-5 h-5 text-brand") : ""}</button>`;
+          }).join("")}</div></section>`
+        : `<p class="mt-5 text-sm text-slate-500 dark:text-slate-400">Будут проверены все подразделения с чек-листом: <b>${s.departments.filter(d => d._count > 0).map(d => d.name).join(", ") || "—"}</b>.</p>`;
+      const restBlock = (s.restaurants || []).length ? `<section class="mb-5">
+        <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Ресторан</h2>
+        <select data-field="setup-restaurant" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">
+          ${s.restaurants.length > 1 ? `<option value="">— выберите ресторан —</option>` : ""}
+          ${s.restaurants.map(r => `<option value="${r.id}" ${s.restaurantId === r.id ? "selected" : ""}>${Reports._esc(r.name)}</option>`).join("")}
+        </select></section>` : "";
+      return App.appBar("Новый аудит", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6">
+        ${resumable}${restBlock}
+        <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Охват проверки</h2>
+        <div class="flex gap-3">${scopeCard("single", "store", "Одно подразделение", "Бар, кухня, зал…")}${scopeCard("all", "layers", "Все подразделения", "Групповой отчёт")}</div>
+        ${deptList}
+        <button data-action="start-audit" class="tnk-press mt-6 w-full h-14 rounded-2xl bg-brand text-white font-semibold text-[15px] inline-flex items-center justify-center gap-2">${UI.icon("clipboard", "w-5 h-5")} Начать аудит</button>
+      </main>`;
+    },
+
+    audit_run() {
+      const a = Audit.active; if (!a) return App.screens.home();
+      const deptId = Audit.ui.deptId;
+      const cats = Audit.data.categories[deptId] || [];
+      const chks = Audit.data.checkpoints[deptId] || [];
+      const scores = Audit.recompute().scores;
+      const tabs = a.deptIds.length > 1 ? `<div class="flex gap-2 overflow-x-auto pb-1 -mx-4 px-4">${a.deptIds.map(id => `
+        <button data-action="switch-dept" data-dept="${id}" class="tnk-press shrink-0 px-4 h-9 rounded-full text-sm font-medium border ${id === deptId ? "bg-brand text-white border-brand" : "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300"}">${App.deptName(id)} · ${Math.round(scores[id] ? scores[id].score : 100)}%</button>`).join("")}</div>` : "";
+      const catBlocks = cats.map(cat => {
+        const catChks = chks.filter(c => c.categoryId === cat.id);
+        const catScore = scores[deptId] && scores[deptId].categories[cat.id] != null ? scores[deptId].categories[cat.id] : 100;
+        const open = Audit.ui.openCat === cat.id;
+        const rows = open ? catChks.map(cp => {
+          const vios = Audit.violationsFor(cp.id);
+          return `<div class="p-4 border-t border-slate-100 dark:border-slate-800">
+            <div class="flex items-start gap-3">
+              <div class="flex-1 min-w-0">
+                <div class="text-[13px] text-slate-400">${cp.index} · ${cp.criterion}</div>
+                <div class="font-medium text-sm">${cp.object}</div>
+                <details class="mt-1"><summary class="text-xs text-brand cursor-pointer select-none">Требование стандарта</summary>
+                  <p class="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">${cp.requirement || "—"}</p></details>
+              </div>
+              <button data-action="open-cp" data-dept="${deptId}" data-cp="${cp.id}" class="tnk-press shrink-0 inline-flex items-center gap-1 px-3 h-9 rounded-xl text-xs font-semibold ${vios.length ? "bg-brand text-white" : "bg-brand/10 text-brand"}">${UI.icon("alert", "w-4 h-4")}${vios.length || ""}</button>
+            </div></div>`;
+        }).join("") : "";
+        return `<div class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
+          <button data-action="toggle-cat" data-cat="${cat.id}" class="w-full flex items-center gap-3 p-4 text-left">
+            <div class="flex-1"><div class="font-semibold text-sm">${cat.name}</div><div class="text-xs text-slate-500">${catChks.length} пунктов · вес ${cat.weight}%</div></div>
+            <span class="font-semibold text-sm ${App.scoreColor(catScore)}">${Math.round(catScore)}%</span>
+            <span class="text-slate-400 transition-transform ${open ? "rotate-180" : ""}">${UI.icon("chevronDown", "w-5 h-5")}</span>
+          </button>${rows}</div>`;
+      }).join("");
+      return App.appBar("Аудит") + `
+        <div class="sticky top-14 z-10 bg-[#F7F8FA]/90 dark:bg-[#0B1120]/90 backdrop-blur border-b border-slate-200/70 dark:border-slate-800">
+          <div class="max-w-3xl mx-auto px-4 py-3">
+            <div class="flex items-end justify-between mb-2">
+              <div><div class="text-xs text-slate-500">${a.restaurant ? Reports._esc(a.restaurant) + " · " : ""}${a.scope === "all" ? "Все подразделения" : App.deptName(deptId)}</div>
+                <div class="text-3xl font-bold ${App.scoreColor(a.finalScore == null ? 100 : a.finalScore)}">${Math.round(a.finalScore == null ? 100 : a.finalScore)}%</div></div>
+              <div class="text-right text-xs text-slate-500">Нарушений<div class="text-lg font-semibold text-slate-700 dark:text-slate-200">${Audit.data.violations.length}</div></div>
+            </div>${tabs}
+          </div></div>
+        <main class="max-w-3xl mx-auto px-4 py-4 space-y-3 pb-28">${catBlocks}</main>
+        <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
+          <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
+            <button data-action="audit-pause" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm inline-flex items-center justify-center gap-2 text-slate-600 dark:text-slate-300">${UI.icon("pause", "w-4 h-4")}Пауза</button>
+            <button data-action="audit-abort" aria-label="Прекратить" class="tnk-press h-12 px-4 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 inline-flex items-center justify-center">${UI.icon("stop", "w-4 h-4")}</button>
+            <button data-action="audit-finish" class="tnk-press flex-[1.4] h-12 rounded-xl bg-brand text-white font-semibold text-sm inline-flex items-center justify-center gap-2">${UI.icon("check", "w-4 h-4")}Завершить</button>
+          </div></footer>`;
+    },
+
+    violation() {
+      const d = VForm.draft; if (!d || !Audit.active) return App.screens.home();
+      const cp = (Audit.data.checkpoints[d.deptId] || []).find(c => c.id === d.checkpointId) || {};
+      const existing = Audit.violationsFor(d.checkpointId);
+      const penaltyOpts = VForm.penalties.map(p => `<option value="${p.id}" ${p.id === d.penaltyId ? "selected" : ""}>${p.label} (−${p.percent}%)</option>`).join("");
+      const roleOpts = `<option value="">— не назначен —</option>` + VForm.orgRoles.map(r => `<option value="${r.id}" ${r.id === d.assigneeRole ? "selected" : ""}>${r.title}</option>`).join("");
+      const thumbs = d.photos.map((p, i) => `<div class="relative shrink-0">
+        <button data-action="vform-edit-photo" data-idx="${i}" class="block w-20 h-20 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700"><img src="${p}" class="w-full h-full object-cover"></button>
+        <button data-action="vform-remove-photo" data-idx="${i}" aria-label="Удалить фото" class="absolute -top-2 -right-2 w-6 h-6 grid place-items-center rounded-full bg-slate-900 text-white shadow">${UI.icon("x", "w-3.5 h-3.5")}</button>
+        <span class="absolute bottom-1 right-1 w-5 h-5 grid place-items-center rounded-full bg-brand text-white">${UI.icon("pencil", "w-3 h-3")}</span></div>`).join("");
+      const sevBtn = (val, label) => `<button data-action="vform-severity" data-val="${val}" class="tnk-press flex-1 h-11 rounded-xl text-sm font-medium border ${d.severity === val ? (val === SEVERITY.CRITICAL ? "bg-brand text-white border-brand" : "bg-slate-900 text-white border-slate-900 dark:bg-slate-100 dark:text-slate-900 dark:border-slate-100") : "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300"}">${label}</button>`;
+      const existingList = existing.length ? `<section class="mt-6"><h3 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Уже добавлено (${existing.length})</h3>
+        <div class="space-y-2">${existing.map(v => `<div class="flex items-center gap-2 p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <span class="w-2 h-2 shrink-0 rounded-full ${v.severity === SEVERITY.CRITICAL ? "bg-brand" : "bg-slate-400"}"></span>
+          <div class="flex-1 min-w-0 text-sm truncate">${v.comment || "Без комментария"} <span class="text-xs text-slate-400">−${v.penaltyPercent}%</span></div>
+          <span class="text-xs text-slate-400">${App.fmtTime(v.createdAt)}</span>
+          <button data-action="del-vio" data-id="${v.id}" aria-label="Удалить" class="text-slate-400">${UI.icon("trash", "w-4 h-4")}</button></div>`).join("")}</div></section>` : "";
+      return App.appBar("Нарушение", { back: "audit_run" }) + `<main class="max-w-3xl mx-auto px-4 py-5 pb-28 space-y-5">
+        <div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div class="text-[13px] text-slate-400">${cp.index || ""} · ${cp.criterion || ""}</div>
+          <div class="font-semibold">${cp.object || ""}</div>
+          ${cp.requirement ? `<p class="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">${cp.requirement}</p>` : ""}
+        </div>
+        <div><label class="block text-sm font-medium mb-2">Тип нарушения</label><div class="flex gap-2">${sevBtn(SEVERITY.CRITICAL, "Критично")}${sevBtn(SEVERITY.NON_CRITICAL, "Некритично")}</div></div>
+        <div><label class="block text-sm font-medium mb-2" for="pen">Штраф</label>
+          <select id="pen" data-field="penalty" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">${penaltyOpts}</select></div>
+        <div><label class="block text-sm font-medium mb-2" for="vComment">Комментарий</label>
+          <div class="relative"><textarea id="vComment" data-field="comment" rows="3" class="w-full p-3 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm resize-none" placeholder="Опишите нарушение…">${d.comment}</textarea>
+            <button data-action="vform-voice" aria-label="Голосовой ввод" class="absolute top-2 right-2 w-9 h-9 grid place-items-center rounded-lg ${Voice.active ? "bg-brand text-white animate-pulse" : "bg-slate-100 dark:bg-slate-800 text-slate-500"}">${UI.icon("mic", "w-5 h-5")}</button></div>
+          ${Voice.active ? '<div class="text-xs text-brand mt-1">Идёт запись… нажмите микрофон, чтобы остановить</div>' : ""}</div>
+        <div><label class="block text-sm font-medium mb-2">Фото</label>
+          <div class="flex gap-3 overflow-x-auto pb-1">${thumbs}
+            <button data-action="vform-add-photo" aria-label="Добавить фото" class="tnk-press shrink-0 w-20 h-20 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 grid place-items-center text-slate-400">${UI.icon("camera", "w-6 h-6")}</button></div>
+          <input id="photoInput" type="file" accept="image/*" capture="environment" multiple class="hidden"></div>
+        <div><label class="block text-sm font-medium mb-2" for="asg">Ответственный (Fix by…)</label>
+          <select id="asg" data-field="assignee" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">${roleOpts}</select></div>
+        <div class="text-xs text-slate-400">Время фиксации: ${App.fmtTime(d.createdAt)}</div>
+        ${existingList}
+      </main>
+      <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
+        <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
+          <button data-action="vform-save-add" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Сохранить и ещё</button>
+          <button data-action="vform-save" class="tnk-press flex-[1.3] h-12 rounded-xl bg-brand text-white font-semibold text-sm">Сохранить</button>
+        </div></footer>`;
+    },
+
+    photo_edit() {
+      App._after = PhotoEdit.init;
+      const toolBtn = (val, icon, label) => `<button data-action="pe-tool" data-val="${val}" class="tnk-press flex-1 h-11 rounded-xl text-sm font-medium border inline-flex items-center justify-center gap-1.5 ${PhotoEdit.tool === val ? "bg-brand text-white border-brand" : "bg-slate-800 border-slate-700 text-slate-200"}">${UI.icon(icon, "w-4 h-4")}${label}</button>`;
+      return `<div class="min-h-dvh flex flex-col bg-slate-950">
+        <header class="flex items-center justify-between px-4 h-14 text-white shrink-0">
+          <button data-action="pe-cancel" aria-label="Отмена" class="w-10 h-10 grid place-items-center">${UI.icon("x", "w-6 h-6")}</button>
+          <span class="text-sm font-medium">Разметка фото</span>
+          <button data-action="pe-save" class="px-4 h-9 rounded-lg bg-brand text-white text-sm font-semibold">Готово</button>
+        </header>
+        <div class="flex-1 grid place-items-center p-4 overflow-hidden"><canvas id="editCanvas" class="max-w-full rounded-lg touch-none"></canvas></div>
+        <div class="p-4 flex gap-2 shrink-0" style="padding-bottom:calc(1rem + env(safe-area-inset-bottom))">
+          ${toolBtn("circle", "circle", "Круг")}${toolBtn("arrow", "arrow", "Стрелка")}
+          <button data-action="pe-undo" aria-label="Отменить последнее" class="tnk-press h-11 px-4 rounded-xl border border-slate-700 text-slate-300 inline-flex items-center justify-center">${UI.icon("undo", "w-4 h-4")}</button>
+        </div></div>`;
+    },
+
+    audit_done() {
+      const a = Audit.active; if (!a) return App.screens.home();
+      const crit = Audit.data.violations.filter(v => v.severity === SEVERITY.CRITICAL).length;
+      const perDept = a.deptIds.map(id => { const sc = a.scores[id];
+        return `<div class="flex items-center justify-between p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <span class="font-medium text-sm">${App.deptName(id)}</span>
+          <span class="font-semibold ${App.scoreColor(sc ? sc.score : 100)}">${Math.round(sc ? sc.score : 100)}%</span></div>`; }).join("");
+      const vioRow = (v) => { const m = Workflow.meta(v.status || "open"); const cp = (Audit.data.checkpoints[v.deptId] || []).find(c => c.id === v.checkpointId) || {};
+        const struck = v.status === VIO_STATUS.DISPUTE_UPHELD;
+        return `<button data-action="wf-open" data-id="${v.id}" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+          <span class="w-2 h-2 shrink-0 rounded-full ${v.severity === SEVERITY.CRITICAL ? "bg-brand" : "bg-slate-400"}"></span>
+          <div class="flex-1 min-w-0"><div class="text-sm font-medium truncate ${struck ? "line-through text-slate-400" : ""}">${Reports._esc(cp.object || "")}</div>
+            <div class="text-xs text-slate-500 truncate">${cp.index || ""} · −${v.penaltyPercent}%${v.comment ? " · " + Reports._esc(v.comment) : ""}</div></div>
+          <span class="text-[11px] px-2 py-0.5 rounded-full ${m.cls}">${m.label}</span></button>`; };
+      const vioList = Audit.data.violations.length
+        ? `<div><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Нарушения (${Audit.data.violations.length})</h2><div class="space-y-2">${Audit.data.violations.map(vioRow).join("")}</div></div>`
+        : "";
+      return App.appBar("Аудит завершён", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-8 space-y-6">
+        <div class="text-center">
+          <div class="w-20 h-20 mx-auto grid place-items-center rounded-full bg-brand/10 text-brand mb-4">${UI.icon("check", "w-10 h-10")}</div>
+          <div class="text-sm text-slate-500">Итоговая оценка</div>
+          <div class="text-5xl font-bold ${App.scoreColor(a.finalScore == null ? 100 : a.finalScore)}">${Math.round(a.finalScore == null ? 100 : a.finalScore)}%</div>
+          <div class="text-sm text-slate-500 mt-2">${a.restaurant ? Reports._esc(a.restaurant) + " · " : ""}${Audit.data.violations.length} нарушений · ${crit} критических</div>
+        </div>
+        <div class="space-y-2">${perDept}</div>
+        ${vioList}
+        <div>
+          <div class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Экспорт отчёта</div>
+          <div class="grid grid-cols-3 gap-2">
+            <button data-action="export-pdf" class="tnk-press flex flex-col items-center gap-1.5 py-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">${UI.icon("file", "w-5 h-5 text-brand")}<span class="text-xs font-medium">PDF</span></button>
+            <button data-action="export-excel" class="tnk-press flex flex-col items-center gap-1.5 py-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">${UI.icon("file", "w-5 h-5 text-emerald-600")}<span class="text-xs font-medium">Excel</span></button>
+            <button data-action="export-html" class="tnk-press flex flex-col items-center gap-1.5 py-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">${UI.icon("download", "w-5 h-5 text-slate-500")}<span class="text-xs font-medium">HTML</span></button>
+          </div>
+        </div>
+        ${App.can("report.share") ? `<button data-action="share-open" data-id="${a.id}" class="tnk-press w-full h-12 rounded-2xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-700 dark:text-slate-200 inline-flex items-center justify-center gap-2">${UI.icon("share", "w-4 h-4")}Поделиться отчётом${(App._access || []).filter(g => g.auditId === a.id).length ? " · " + (App._access || []).filter(g => g.auditId === a.id).length : ""}</button>` : ""}
+        <button data-route="home" class="tnk-press w-full h-14 rounded-2xl bg-brand text-white font-semibold">На главную</button>
+      </main>`;
+    },
+
+    share() {
+      const s = App.shr; if (!s || !App.can("report.share")) return App.screens.audit_done();
+      const granted = new Set(s.granted);
+      const row = (u) => `<label class="flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 cursor-pointer">
+        <input type="checkbox" data-field="share-user" value="${u.id}" ${granted.has(u.id) ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]">
+        <div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${Reports._esc(u.name)}</div><div class="text-xs text-slate-500 truncate">${Reports._esc(u.position || "")}${u.login ? " · @" + Reports._esc(u.login) : ""}</div></div></label>`;
+      const others = App.users.filter(u => u.active && u.id !== App.user.id);
+      return App.appBar("Доступ к отчёту", { back: "audit_done" }) + `<main class="max-w-3xl mx-auto px-4 py-6 pb-28 space-y-3">
+        <p class="text-[13px] text-slate-500 dark:text-slate-400">Отмеченные пользователи увидят этот отчёт в своей истории, даже если он вне их области доступа.</p>
+        ${others.length ? others.map(row).join("") : '<div class="text-sm text-slate-500 text-center py-8">Нет других пользователей.</div>'}
+      </main>
+      <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
+        <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
+          <button data-route="audit_done" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отмена</button>
+          <button data-action="share-save" class="tnk-press flex-[1.3] h-12 rounded-xl bg-brand text-white font-semibold text-sm">Сохранить доступ</button>
+        </div></footer>`;
+    },
+
+    dashboard() {
+      if (!App.can("analytics.view")) return App.screens.home();
+      const d = App.dash;
+      const queueRow = (it, kind) => `<button data-action="wf-open-ctx" data-audit="${it.a.id}" data-vio="${it.v.id}" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+        <div class="w-9 h-9 shrink-0 grid place-items-center rounded-xl ${kind === "vote" ? "bg-violet-500/10 text-violet-500" : "bg-amber-500/10 text-amber-500"}">${UI.icon(kind === "vote" ? "shield" : "inbox", "w-5 h-5")}</div>
+        <div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${Reports._esc(it.cp.object || "")}</div>
+          <div class="text-xs text-slate-500 truncate">${it.a.restaurant ? Reports._esc(it.a.restaurant) + " · " : ""}${kind === "vote" ? "ждёт вашего согласования" : "исправление на проверке"}</div></div>
+        ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`;
+      const queue = (d.voteQueue.length || d.resolveQueue.length)
+        ? `<section><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Требует внимания (${d.voteQueue.length + d.resolveQueue.length})</h2>
+            <div class="space-y-2">${d.voteQueue.map(it => queueRow(it, "vote")).join("")}${d.resolveQueue.map(it => queueRow(it, "fix")).join("")}</div></section>`
+        : `<section><div class="p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-500/5 border border-emerald-200 dark:border-emerald-500/20 text-sm text-emerald-700 dark:text-emerald-400 flex items-center gap-2">${UI.icon("check", "w-5 h-5")}Нет задач, требующих действий.</div></section>`;
+      const attention = d.attention.length ? `<section><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">На что обратить внимание</h2>
+        <div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-2">${d.attention.map((t, i) => `<div class="flex items-center gap-3"><span class="w-6 h-6 shrink-0 grid place-items-center rounded-lg bg-brand/10 text-brand text-xs font-semibold">${i + 1}</span><span class="flex-1 text-sm truncate">${Reports._esc(t.name)}</span><span class="text-sm font-semibold text-slate-500">${t.count}</span></div>`).join("")}</div></section>` : "";
+      const recent = d.recent.length ? `<section><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Последние проверки</h2>
+        <div class="space-y-2">${d.recent.map(a => `<button data-action="open-history-item" data-id="${a.id}" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+          <div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${a.restaurant ? Reports._esc(a.restaurant) + " · " : ""}${a.scope === "all" ? "Все" : App.deptName(a.deptIds[0])}</div><div class="text-xs text-slate-500">${App.fmtDate(a.startedAt)}</div></div>
+          <span class="font-semibold ${App.scoreColor(a.finalScore == null ? 100 : a.finalScore)}">${Math.round(a.finalScore == null ? 100 : a.finalScore)}%</span></button>`).join("")}</div></section>` : "";
+      return App.appBar("Дашборд", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-5">
+        <div class="grid grid-cols-2 gap-3">
+          <div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-center"><div class="text-3xl font-bold ${d.avg == null ? "text-slate-400" : App.scoreColor(d.avg)}">${d.avg == null ? "—" : d.avg + "%"}</div><div class="text-xs text-slate-500 mt-0.5">средняя оценка</div></div>
+          <div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-center"><div class="text-3xl font-bold">${d.count}</div><div class="text-xs text-slate-500 mt-0.5">проверок</div></div>
+        </div>
+        ${queue}${attention}${recent}
+        ${App.can("audit.conduct") ? `<button data-action="new-audit" class="tnk-press w-full h-13 py-4 rounded-2xl bg-brand text-white font-semibold inline-flex items-center justify-center gap-2">${UI.icon("clipboard", "w-5 h-5")}Провести проверку</button>` : ""}
+      </main>`;
+    },
+
+    vio_detail() {
+      const ctx = Workflow.ctx; if (!ctx || !ctx.vio) return App.screens.audit_done();
+      const v = ctx.vio, st = v.status || VIO_STATUS.OPEN, m = Workflow.meta(st);
+      const audit = Audit.active || {};
+      const cp = (Audit.data.checkpoints[v.deptId] || []).find(c => c.id === v.checkpointId) || {};
+      const assignee = (App._orgRoles.find(r => r.id === v.assigneeRole) || {}).title;
+      const photoStrip = (arr) => (arr && arr.length) ? `<div class="flex gap-2 flex-wrap mt-2">${arr.map(p => `<img src="${p}" class="w-24 h-24 object-cover rounded-lg border border-slate-200 dark:border-slate-700">`).join("")}</div>` : "";
+      // Finding (from violation itself)
+      const findingBlock = `<div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+        <div class="flex items-center gap-2 mb-1"><span class="w-2 h-2 rounded-full ${v.severity === SEVERITY.CRITICAL ? "bg-brand" : "bg-slate-400"}"></span>
+          <span class="text-xs font-semibold text-slate-500">Замечание · ${audit.auditorName || ""} · ${App.fmtTime(v.createdAt)}</span></div>
+        ${v.comment ? `<div class="text-sm">${Reports._esc(v.comment)}</div>` : '<div class="text-sm text-slate-400">Без комментария</div>'}
+        ${photoStrip(v.photos)}</div>`;
+      // Thread (fixes / disputes / decisions)
+      const kindStyle = { fix: "border-l-4 border-amber-400", dispute: "border-l-4 border-violet-400", decision: "border-l-4 border-emerald-400" };
+      const kindName = { fix: "Исправление", dispute: "Оспаривание", decision: "Решение" };
+      const thread = (v.thread || []).filter(e => e.kind && e.kind !== "finding").map(e => `<div class="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 ${kindStyle[e.kind] || ""}">
+        <div class="text-xs font-semibold text-slate-500 mb-1">${kindName[e.kind] || ""} · ${Reports._esc(e.name || "")}${e.role ? " (" + Reports._esc(e.role) + ")" : ""} · ${App.fmtTime(e.ts)}</div>
+        ${e.text ? `<div class="text-sm">${Reports._esc(e.text)}</div>` : ""}${photoStrip(e.photos)}</div>`).join("");
+
+      // Action availability
+      const canFix = [VIO_STATUS.OPEN, VIO_STATUS.FIX_SUBMITTED, VIO_STATUS.DISPUTE_REJECTED].includes(st);
+      const canResolve = Workflow.canResolve(audit) && st === VIO_STATUS.FIX_SUBMITTED;
+      const canDispute = App.can("dispute.raise") && [VIO_STATUS.OPEN, VIO_STATUS.FIX_SUBMITTED].includes(st) && !v.dispute;
+      const isApprover = st === VIO_STATUS.DISPUTED && Workflow.isApprover(audit) && !(v.dispute && (v.dispute.votes || []).some(x => x.userId === App.user.id));
+      const composerPhotos = (ctx.composerPhotos || []);
+      const composer = (canFix || canDispute) ? `<div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-3">
+        <textarea id="wfText" data-field="wf-text" rows="2" placeholder="Комментарий…" class="w-full p-3 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm resize-none">${Reports._esc(ctx.wfText || "")}</textarea>
+        ${composerPhotos.length ? `<div class="flex gap-2 flex-wrap">${composerPhotos.map((p, i) => `<div class="relative"><img src="${p}" class="w-16 h-16 object-cover rounded-lg"><button data-action="wf-photo-del" data-idx="${i}" class="absolute -top-1.5 -right-1.5 w-5 h-5 grid place-items-center rounded-full bg-slate-900 text-white">${UI.icon("x", "w-3 h-3")}</button></div>`).join("")}</div>` : ""}
+        <div class="flex gap-2">
+          <button data-action="wf-add-photo" class="tnk-press h-11 px-3 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 inline-flex items-center gap-1.5 text-sm">${UI.icon("camera", "w-4 h-4")}Фото</button>
+          ${canFix ? `<button data-action="wf-fix" class="tnk-press flex-1 h-11 rounded-xl bg-brand text-white font-semibold text-sm">Отправить исправление</button>` : ""}
+        </div>
+        ${canDispute ? `<button data-action="wf-dispute" class="tnk-press w-full h-11 rounded-xl border border-violet-300 text-violet-600 dark:text-violet-400 font-medium text-sm">Оспорить (текст выше = причина)</button>` : ""}
+        <input id="wfPhotoInput" type="file" accept="image/*" capture="environment" multiple class="hidden">
+      </div>` : "";
+      const resolveBar = canResolve ? `<div class="flex gap-2">
+        <button data-action="wf-reject" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Вернуть на доработку</button>
+        <button data-action="wf-resolve" class="tnk-press flex-[1.3] h-12 rounded-xl bg-emerald-600 text-white font-semibold text-sm">Принять исправление</button></div>` : "";
+      const votes = (v.dispute && v.dispute.votes) || [];
+      const polSummary = Workflow.policySummary(audit);
+      const votesLine = votes.length ? `<div class="text-xs text-slate-500">Голоса: ${votes.map(x => `${Reports._esc(x.name)} — ${x.approve ? "за" : "против"}`).join(", ")}</div>` : "";
+      const disputeInfo = (st === VIO_STATUS.DISPUTED) ? `<div class="p-3 rounded-2xl bg-violet-50 dark:bg-violet-500/5 border border-violet-200 dark:border-violet-500/20 text-xs text-slate-600 dark:text-slate-300">
+        <div class="font-medium mb-0.5">На согласовании</div>${polSummary ? `<div class="text-slate-500">Правило: ${Reports._esc(polSummary)}</div>` : '<div class="text-slate-500">Решает первый согласующий (политика не задана)</div>'}${votesLine}</div>` : "";
+      const approveBar = isApprover ? `<div class="p-4 rounded-2xl bg-violet-50 dark:bg-violet-500/5 border border-violet-200 dark:border-violet-500/20 space-y-2">
+        <div class="text-sm font-medium">Ваш голос по оспариванию</div>
+        <div class="text-xs text-slate-500">${Reports._esc((v.dispute && v.dispute.reason) || "")}</div>
+        <div class="flex gap-2 pt-1">
+          <button data-action="wf-vote-reject" class="tnk-press flex-1 h-11 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отклонить</button>
+          <button data-action="wf-vote-approve" class="tnk-press flex-1 h-11 rounded-xl bg-violet-600 text-white font-semibold text-sm">Согласовать</button></div></div>` : "";
+      const gateNote = (st === VIO_STATUS.FIX_SUBMITTED && App.can("task.resolve") && !canResolve)
+        ? `<div class="text-xs text-slate-500 text-center">Принять может только сотрудник рангом не ниже проводившего аудит.</div>` : "";
+
+      return App.appBar("Нарушение", { back: "audit_done" }) + `<main class="max-w-3xl mx-auto px-4 py-5 pb-28 space-y-4">
+        <div class="flex items-center justify-between">
+          <div class="text-sm text-slate-500">${cp.index || ""} · ${Reports._esc(cp.criterion || "")}</div>
+          <span class="text-xs px-2.5 py-1 rounded-full ${m.cls}">${m.label}</span></div>
+        <div class="text-lg font-semibold">${Reports._esc(cp.object || "")}</div>
+        <div class="text-xs text-slate-500">−${v.penaltyPercent}%${assignee ? " · ответственный: " + Reports._esc(assignee) : ""}${v.status === VIO_STATUS.DISPUTE_UPHELD ? " · балл восстановлен" : ""}</div>
+        ${findingBlock}
+        ${thread}
+        ${disputeInfo}${resolveBar}${gateNote}${approveBar}${composer}
+      </main>`;
+    },
+
+    history() {
+      const h = App.hist, f = App.histFilter, nf = App.histActiveFilters();
+      const canDelete = App.can("audit.delete");
+      const raw = App.histRaw.audits;
+      // Filter option sources (derived from visible audit set)
+      const auditors = [...new Map(raw.map(a => [a.auditorId, a.auditorName])).entries()].map(([id, name]) => ({ id, name }));
+      const rests = [...new Map(raw.filter(a => a.restaurantId).map(a => [a.restaurantId, a.restaurant])).entries()].map(([id, name]) => ({ id, name }));
+      const depts = [...new Set(raw.flatMap(a => a.deptIds || []))].map(id => ({ id, name: App.deptName(id) }));
+      const opt = (val, cur, label) => `<option value="${val}" ${cur === val ? "selected" : ""}>${Reports._esc(label)}</option>`;
+      const sel = (field, cur, ph, items) => `<select data-field="${field}" class="w-full h-11 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">
+        <option value="">${ph}</option>${items.map(it => opt(it.id, cur, it.name)).join("")}</select>`;
+      const filterPanel = App.histFilterOpen ? `<div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-3">
+        <div class="grid grid-cols-2 gap-2">
+          <div><label class="block text-xs text-slate-500 mb-1">Период с</label><input type="date" data-field="hf-from" value="${f.from}" class="w-full h-11 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"></div>
+          <div><label class="block text-xs text-slate-500 mb-1">по</label><input type="date" data-field="hf-to" value="${f.to}" class="w-full h-11 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"></div>
+        </div>
+        ${sel("hf-auditor", f.auditorId, "Проверяющий — любой", auditors)}
+        ${rests.length ? sel("hf-restaurant", f.restaurantId, "Ресторан — любой", rests) : ""}
+        ${sel("hf-dept", f.deptId, "Подразделение — любое", depts)}
+        ${sel("hf-assignee", f.assignee, "Ответственный — любой", App._orgRoles.map(r => ({ id: r.id, name: r.title })))}
+        <div class="flex gap-2 pt-1">
+          <button data-action="hist-reset" class="tnk-press flex-1 h-10 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300">Сбросить</button>
+          <button data-action="hist-export" class="tnk-press flex-[1.3] h-10 rounded-xl bg-brand text-white text-sm font-semibold inline-flex items-center justify-center gap-1.5">${UI.icon("download", "w-4 h-4")}Выгрузить за период</button>
+        </div>
+      </div>` : "";
+      const filterBar = `<div class="flex items-center gap-2">
+        <button data-action="hist-filter-toggle" class="tnk-press inline-flex items-center gap-1.5 h-9 px-3 rounded-xl border ${nf ? "border-brand text-brand bg-brand/5" : "border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300"} text-sm font-medium">${UI.icon("filter", "w-4 h-4")}Фильтры${nf ? ` · ${nf}` : ""}</button>
+        ${nf ? `<button data-action="hist-reset" class="tnk-press text-sm text-slate-400">Сбросить</button>` : ""}
+      </div>`;
+
+      if (!raw.length) {
+        return App.appBar("История", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6">
+          <div class="px-6 py-14 rounded-3xl border border-dashed border-slate-300 dark:border-slate-700 text-center">
+            <div class="w-12 h-12 mx-auto grid place-items-center rounded-2xl bg-slate-100 dark:bg-slate-800 text-slate-400 mb-4">${UI.icon("chart", "w-6 h-6")}</div>
+            <div class="font-semibold">Пока нет завершённых аудитов</div>
+            <div class="text-sm text-slate-500 mt-1">Проведите первую проверку — здесь появятся тренды и статистика.</div></div></main>`;
+      }
+
+      App._after = History.drawChart;
+      const kpi = `<div class="grid grid-cols-3 gap-2">
+        <div class="p-3 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-center"><div class="text-2xl font-bold ${h.avg == null ? "text-slate-400" : App.scoreColor(h.avg)}">${h.avg == null ? "—" : h.avg + "%"}</div><div class="text-[11px] text-slate-500">средняя</div></div>
+        <div class="p-3 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-center"><div class="text-2xl font-bold">${h.audits.length}</div><div class="text-[11px] text-slate-500">аудитов</div></div>
+        <div class="p-3 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-center"><div class="text-2xl font-bold">${h.total}</div><div class="text-[11px] text-slate-500">нарушений</div></div>
+      </div>`;
+      const chart = h.trend.length >= 2
+        ? `<div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+            <div class="text-sm font-semibold mb-3">Динамика итоговой оценки</div><div style="height:180px"><canvas id="trendChart"></canvas></div></div>`
+        : "";
+      const top = h.top.length ? `<div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+        <div class="text-sm font-semibold mb-3">Топ-5 частых нарушений</div>
+        <div class="space-y-2">${h.top.map((t, i) => `<div class="flex items-center gap-3">
+          <span class="w-6 h-6 shrink-0 grid place-items-center rounded-lg bg-brand/10 text-brand text-xs font-semibold">${i + 1}</span>
+          <span class="flex-1 text-sm truncate">${Reports._esc(t.name)}</span><span class="text-sm font-semibold text-slate-500">${t.count}</span></div>`).join("")}</div></div>` : "";
+      const rec = h.top.length ? `<div class="p-4 rounded-2xl bg-brand/5 border border-brand/20 text-sm"><span class="font-semibold text-brand">Рекомендация.</span> Чаще всего замечания по «${Reports._esc(h.top[0].name)}» (${h.top[0].count}). Уделите этому пункту внимание на ближайших сменах.</div>` : "";
+      const statusChip = (s) => s === AUDIT_STATUS.COMPLETED
+        ? '<span class="text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">завершён</span>'
+        : '<span class="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">отменён</span>';
+      const row = (a) => `<div class="flex items-center rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
+        <button data-action="open-history-item" data-id="${a.id}" class="tnk-press flex-1 min-w-0 flex items-center gap-3 p-4 text-left">
+          <div class="flex-1 min-w-0"><div class="flex items-center gap-2"><span class="font-medium text-sm truncate">${a.scope === "all" ? "Все подразделения" : App.deptName(a.deptIds[0])}</span>${statusChip(a.status)}</div>
+            <div class="text-xs text-slate-500 mt-0.5 truncate">${a.restaurant ? Reports._esc(a.restaurant) + " · " : ""}${Reports._esc(a.auditorName || "")} · ${App.fmtDate(a.startedAt)}</div></div>
+          <span class="font-semibold ${App.scoreColor(a.finalScore == null ? 100 : a.finalScore)}">${a.status === AUDIT_STATUS.COMPLETED ? Math.round(a.finalScore == null ? 100 : a.finalScore) + "%" : "—"}</span>
+        </button>
+        ${canDelete ? `<button data-action="del-audit" data-id="${a.id}" aria-label="Удалить аудит" class="tnk-press shrink-0 w-12 self-stretch grid place-items-center text-slate-400 border-l border-slate-100 dark:border-slate-800">${UI.icon("trash", "w-4 h-4")}</button>` : ""}
+      </div>`;
+      const list = h.audits.length ? h.audits.map(row).join("") : '<div class="text-center text-sm text-slate-500 py-8">Нет аудитов по выбранным фильтрам.</div>';
+      return App.appBar("История", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-4">
+        ${filterBar}${filterPanel}${kpi}${chart}${top}${rec}
+        <div><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Аудиты (${h.audits.length})</h2>
+        <div class="space-y-2">${list}</div></div></main>`;
+    },
+    constructor() { return App.can("checklist.edit") ? App.stub("Конструктор", "Категории/пункты/веса/штрафы — Шаг 4") : App.screens.home(); },
+
+    settings() {
+      if (!App.isAdmin()) return App.screens.home();
+      const userRow = (u) => {
+        const initials = (u.name || "?").split(" ").map(s => s[0]).slice(0, 2).join("").toUpperCase();
+        const ava = u.photo ? `<img src="${u.photo}" alt="" class="w-10 h-10 rounded-full object-cover shrink-0">`
+          : `<div class="w-10 h-10 shrink-0 grid place-items-center rounded-full bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-200 text-xs font-semibold">${initials}</div>`;
+        return `<button data-action="adm-user-edit" data-id="${u.id}" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+          ${ava}
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2"><span class="font-medium text-sm truncate">${Reports._esc(u.name)}</span>
+              ${u.active ? "" : '<span class="text-[11px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">выключен</span>'}</div>
+            <div class="text-xs text-slate-500 truncate">@${Reports._esc(u.login || "")} · ${Reports._esc(u.position || "—")} · ${Reports._esc(App.userRoleNames(u))}</div>
+          </div>${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`;
+      };
+      const roleRow = (r) => {
+        const n = (r.permissions || []).includes("*") ? "все права" : (r.permissions || []).length + " прав";
+        return `<button data-action="adm-role-edit" data-id="${r.id}" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+          <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("layers", "w-5 h-5")}</div>
+          <div class="flex-1 min-w-0"><div class="font-medium text-sm truncate">${Reports._esc(r.name)}${r.system ? ' <span class="text-[11px] text-slate-400">· системная</span>' : ""}</div>
+            <div class="text-xs text-slate-500">${n}</div></div>
+          ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`;
+      };
+      return App.appBar("Настройки", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-6">
+        <section>
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Пользователи (${App.users.length})</h2>
+            <button data-action="adm-user-new" class="tnk-press inline-flex items-center gap-1 text-[13px] font-semibold text-brand">${UI.icon("plus", "w-4 h-4")}Добавить</button>
+          </div>
+          <div class="space-y-2">${App.users.map(userRow).join("")}</div>
+        </section>
+        <section>
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Роли (${App._roles.length})</h2>
+            <button data-action="adm-role-new" class="tnk-press inline-flex items-center gap-1 text-[13px] font-semibold text-brand">${UI.icon("plus", "w-4 h-4")}Добавить</button>
+          </div>
+          <div class="space-y-2">${App._roles.map(roleRow).join("")}</div>
+        </section>
+        <section>
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Структура компании</h2>
+          <div class="space-y-2">
+            <button data-route="geo" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+              <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("store", "w-5 h-5")}</div>
+              <div class="flex-1"><div class="font-medium text-sm">География</div><div class="text-xs text-slate-500">Страна → город → ресторан (${App._geo.length})</div></div>
+              ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>
+            <button data-route="positions" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+              <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("users", "w-5 h-5")}</div>
+              <div class="flex-1"><div class="font-medium text-sm">Должности</div><div class="text-xs text-slate-500">Иерархия подчинения (${App._positions.length})</div></div>
+              ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>
+            <button data-action="pol-list" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+              <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("shield", "w-5 h-5")}</div>
+              <div class="flex-1"><div class="font-medium text-sm">Согласование оспариваний</div><div class="text-xs text-slate-500">Согласующие, веса, правило (${(App._policies || []).length})</div></div>
+              ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>
+          </div>
+        </section>
+      </main>`;
+    },
+
+    policies() {
+      if (!App.isAdmin()) return App.screens.home();
+      const pol = App._policies || [];
+      const rests = App._geo.filter(n => n.type === "restaurant");
+      const card = (id, title, sub) => { const p = pol.find(x => x.id === id);
+        const badge = p && (p.approvers || []).length ? `${p.mode === "unanimous" ? "единогласно" : "порог " + (p.threshold || 60) + "%"} · ${p.approvers.length} чел.` : "не задано";
+        return `<button data-action="pol-edit" data-id="${id}" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+          <div class="flex-1 min-w-0"><div class="font-medium text-sm truncate">${Reports._esc(title)}</div><div class="text-xs text-slate-500">${sub} · ${badge}</div></div>
+          ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`; };
+      return App.appBar("Согласование оспариваний", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-4">
+        <p class="text-[13px] text-slate-500 dark:text-slate-400">Кто согласует оспаривания, с каким весом голоса и по какому правилу. «По умолчанию» применяется, если у ресторана нет своей политики. ★ у согласующего = право решать в обход остальных.</p>
+        <section><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Общая</h2>
+          ${card("default", "По умолчанию", "все рестораны")}</section>
+        ${rests.length ? `<section><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">По ресторанам</h2>
+          <div class="space-y-2">${rests.map(r => card(r.id, r.name, "ресторан")).join("")}</div></section>` : ""}
+      </main>`;
+    },
+
+    policy_edit() {
+      const d = App.adm.pDraft; if (!d || !App.isAdmin()) return App.screens.home();
+      const approvers = App.users.filter(u => u.active && (App._roles.find(r => (u.roleIds || []).includes(r.id) && ((r.permissions || []).includes("*") || (r.permissions || []).includes("dispute.approve")))));
+      const chosen = new Map((d.approvers || []).map(a => [a.userId, a]));
+      const rows = approvers.map(u => { const a = chosen.get(u.id); const on = !!a;
+        return `<div class="p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <label class="flex items-center gap-3 cursor-pointer">
+            <input type="checkbox" data-field="pol-approver" value="${u.id}" ${on ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]">
+            <span class="flex-1 text-sm font-medium">${Reports._esc(u.name)} <span class="text-xs text-slate-400">${Reports._esc(u.position || "")}</span></span></label>
+          ${on ? `<div class="flex items-center gap-3 mt-2 pl-8">
+            <label class="text-xs text-slate-500">Вес <input type="number" min="1" data-field="pol-weight" data-uid="${u.id}" value="${a.weight || 1}" class="w-14 h-8 ml-1 px-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm"></label>
+            <label class="flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300 cursor-pointer"><input type="checkbox" data-field="pol-override" data-uid="${u.id}" ${a.canOverride ? "checked" : ""} class="w-4 h-4 accent-[#EA1B24]"> решает в обход ★</label>
+          </div>` : ""}
+        </div>`; }).join("");
+      const title = d.id === "default" ? "По умолчанию" : ((App._geo.find(n => n.id === d.id) || {}).name || "Политика");
+      return App.appBar("Политика: " + title, { back: "policies" }) + `<main class="max-w-3xl mx-auto px-4 py-6 pb-28 space-y-5">
+        <div><label class="block text-sm font-medium mb-2">Правило</label>
+          <div class="flex gap-2">
+            <button data-action="pol-mode" data-val="unanimous" class="tnk-press flex-1 h-11 rounded-xl text-sm font-medium border ${d.mode === "unanimous" ? "bg-brand text-white border-brand" : "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300"}">Единогласно</button>
+            <button data-action="pol-mode" data-val="threshold" class="tnk-press flex-1 h-11 rounded-xl text-sm font-medium border ${d.mode === "threshold" ? "bg-brand text-white border-brand" : "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300"}">Порог по весу</button>
+          </div></div>
+        ${d.mode === "threshold" ? `<div><label class="block text-sm font-medium mb-2">Порог одобрения: ${d.threshold || 60}% от суммы весов</label>
+          <input type="range" min="10" max="100" step="5" data-field="pol-threshold" value="${d.threshold || 60}" class="w-full accent-[#EA1B24]"></div>` : ""}
+        <div><label class="block text-sm font-medium mb-2">Согласующие</label>
+          ${approvers.length ? `<div class="space-y-2">${rows}</div>` : '<div class="text-[13px] text-slate-500 p-3 rounded-xl border border-dashed border-slate-300 dark:border-slate-700">Нет пользователей с правом «Согласовывать оспаривания». Выдайте право через Роли.</div>'}</div>
+      </main>
+      <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
+        <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
+          <button data-route="policies" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отмена</button>
+          <button data-action="pol-save" class="tnk-press flex-[1.3] h-12 rounded-xl bg-brand text-white font-semibold text-sm">Сохранить</button>
+        </div></footer>`;
+    },
+
+    geo() {
+      if (!App.can("geo.manage")) return App.screens.home();
+      const list = App._geo;
+      const row = (n, depth) => {
+        const adds = Geo.CHILD[n.type].map(t =>
+          `<button data-action="geo-add" data-parent="${n.id}" data-type="${t}" class="tnk-press shrink-0 text-[11px] font-semibold text-brand px-2 h-7 rounded-lg bg-brand/5">+ ${Geo.TYPES[t]}</button>`).join("");
+        return `<div class="flex items-center gap-2 py-2.5 border-b border-slate-100 dark:border-slate-800" style="margin-left:${depth * 16}px">
+          <span class="shrink-0 text-[11px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">${Geo.TYPES[n.type]}</span>
+          <span class="flex-1 min-w-0 text-sm font-medium truncate">${Reports._esc(n.name)}</span>
+          ${adds}
+          <button data-action="geo-del" data-id="${n.id}" aria-label="Удалить" class="tnk-press shrink-0 w-7 h-7 grid place-items-center rounded-lg text-slate-400">${UI.icon("trash", "w-4 h-4")}</button>
+        </div>` + Geo.children(list, n.id).map(c => row(c, depth + 1)).join("");
+      };
+      const tree = Geo.children(list, null).map(n => row(n, 0)).join("");
+      return App.appBar("География", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6">
+        <button data-action="geo-add" data-type="country" class="tnk-press w-full h-12 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-500 mb-4">+ Добавить страну</button>
+        ${tree || '<div class="text-center text-sm text-slate-500 py-10">Пока пусто. Добавьте страну, затем город и рестораны.</div>'}
+      </main>`;
+    },
+
+    positions() {
+      if (!App.can("org.manage")) return App.screens.home();
+      const list = App._positions;
+      const kids = (pid) => list.filter(p => (p.parentId || null) === (pid || null));
+      const row = (p, depth) => `<div class="flex items-center gap-2 py-2.5 border-b border-slate-100 dark:border-slate-800" style="margin-left:${depth * 16}px">
+          <span class="flex-1 min-w-0 text-sm font-medium truncate">${Reports._esc(p.title)}</span>
+          <button data-action="pos-add" data-parent="${p.id}" class="tnk-press shrink-0 text-[11px] font-semibold text-brand px-2 h-7 rounded-lg bg-brand/5">+ подчинённый</button>
+          <button data-action="pos-del" data-id="${p.id}" aria-label="Удалить" class="tnk-press shrink-0 w-7 h-7 grid place-items-center rounded-lg text-slate-400">${UI.icon("trash", "w-4 h-4")}</button>
+        </div>` + kids(p.id).map(c => row(c, depth + 1)).join("");
+      const tree = kids(null).map(p => row(p, 0)).join("");
+      return App.appBar("Должности", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6">
+        <p class="text-[13px] text-slate-500 dark:text-slate-400 mb-4">Иерархия «кто кому подчиняется». Верхний уровень — руководство; чем выше должность, тем выше ранг при закрытии нарушений и согласованиях.</p>
+        <button data-action="pos-add" class="tnk-press w-full h-12 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-500 mb-4">+ Добавить должность верхнего уровня</button>
+        ${tree || '<div class="text-center text-sm text-slate-500 py-10">Пока пусто.</div>'}
+      </main>`;
+    },
+
+    user_edit() {
+      const d = App.adm.uDraft; if (!d || !App.isAdmin()) return App.screens.home();
+      const isNew = !App.users.some(u => u.id === d.id);
+      const isSelf = App.user && d.id === App.user.id;
+      const initials = (d.name || "?").trim().split(/\s+/).map(s => s[0]).slice(0, 2).join("").toUpperCase() || "?";
+      const ava = d.photo ? `<img src="${d.photo}" alt="" class="w-20 h-20 rounded-full object-cover">`
+        : `<div class="w-20 h-20 grid place-items-center rounded-full bg-brand text-white text-2xl font-semibold">${initials}</div>`;
+      const input = (field, label, val, ph, extra) => `<div><label class="block text-sm font-medium mb-2">${label}</label>
+        <input data-field="${field}" value="${Reports._esc(val || "")}" placeholder="${ph || ""}" ${extra || ""}
+          class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"></div>`;
+      const roleChecks = App._roles.map(r => `<label class="flex items-center gap-3 p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 cursor-pointer">
+        <input type="checkbox" data-field="u-role" value="${r.id}" ${(d.roleIds || []).includes(r.id) ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]">
+        <span class="text-sm font-medium">${Reports._esc(r.name)}</span></label>`).join("");
+      return App.appBar(isNew ? "Новый пользователь" : "Пользователь", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6 pb-28 space-y-5">
+        <div class="flex items-center gap-4">
+          ${ava}
+          <div class="space-y-2">
+            <button data-action="adm-user-photo" class="tnk-press inline-flex items-center gap-1.5 px-3 h-9 rounded-xl border border-slate-200 dark:border-slate-700 text-[13px] font-medium text-slate-600 dark:text-slate-300">${UI.icon("camera", "w-4 h-4")}Фото</button>
+            ${d.photo ? `<button data-action="adm-user-photo-del" class="tnk-press block text-[13px] text-slate-400">Убрать фото</button>` : ""}
+          </div>
+          <input id="uPhotoInput" type="file" accept="image/*" class="hidden">
+        </div>
+        ${input("u-name", "ФИО", d.name, "Иванов Иван")}
+        ${input("u-login", "Логин", d.login, "латиницей, без пробелов", 'autocapitalize="none" spellcheck="false"')}
+        ${App._positions.length
+          ? `<div><label class="block text-sm font-medium mb-2">Должность</label>
+              <select data-field="u-positionId" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">
+                <option value="">— не выбрана —</option>
+                ${App._positions.map(p => `<option value="${p.id}" ${d.positionId === p.id ? "selected" : ""}>${Reports._esc(p.title)}</option>`).join("")}
+              </select></div>`
+          : input("u-position", "Должность", d.position, "например, Директор ресторана")}
+        ${input("u-pin", "PIN (4–6 цифр)", d.pin, "••••", 'inputmode="numeric" maxlength="6"')}
+        <div><label class="block text-sm font-medium mb-2">Роли</label><div class="space-y-2">${roleChecks}</div></div>
+        <div><label class="block text-sm font-medium mb-2">Область доступа</label>
+          ${App._geo.length ? `<div class="p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+            <div class="text-xs text-slate-500 mb-2">Отметьте узлы — доступ распространяется на всё вложенное. Пусто = без ограничений.</div>
+            ${(function scopeTree(pid, depth) {
+              return Geo.children(App._geo, pid).map(n => `<label class="flex items-center gap-2 py-1.5 cursor-pointer" style="margin-left:${depth * 20}px">
+                <input type="checkbox" data-field="u-scope" value="${n.id}" ${(d.scope || []).includes(n.id) ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]">
+                <span class="text-[11px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">${Geo.TYPES[n.type]}</span>
+                <span class="text-sm">${Reports._esc(n.name)}</span></label>` + scopeTree(n.id, depth + 1)).join("");
+            })(null, 0)}
+          </div>` : '<div class="text-[13px] text-slate-500 p-3 rounded-xl border border-dashed border-slate-300 dark:border-slate-700">География ещё не создана — доступ пока без ограничений.</div>'}
+        </div>
+        <label class="flex items-center gap-3 p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 cursor-pointer ${isSelf ? "opacity-50" : ""}">
+          <input type="checkbox" data-field="u-active" ${d.active ? "checked" : ""} ${isSelf ? "disabled" : ""} class="w-5 h-5 accent-[#EA1B24]">
+          <span class="text-sm font-medium">Активен</span>${isSelf ? '<span class="text-xs text-slate-400">— это вы</span>' : ""}</label>
+        ${!isNew && !isSelf ? `<button data-action="adm-user-del" data-id="${d.id}" class="tnk-press w-full h-12 rounded-xl border border-brand/30 text-brand font-medium text-sm inline-flex items-center justify-center gap-2">${UI.icon("trash", "w-4 h-4")}Удалить пользователя</button>` : ""}
+      </main>
+      <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
+        <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
+          <button data-route="settings" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отмена</button>
+          <button data-action="adm-user-save" class="tnk-press flex-[1.3] h-12 rounded-xl bg-brand text-white font-semibold text-sm">Сохранить</button>
+        </div></footer>`;
+    },
+
+    role_edit() {
+      const d = App.adm.rDraft; if (!d || !App.isAdmin()) return App.screens.home();
+      const isNew = !App._roles.some(r => r.id === d.id);
+      const locked = !!d.system;
+      const all = (d.permissions || []).includes("*");
+      const groups = PERMISSION_GROUPS.map(g => `<div class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
+        <div class="px-4 pt-3 pb-1 text-xs font-semibold uppercase tracking-wider text-slate-400">${g.group}</div>
+        ${g.perms.map(p => `<label class="flex items-center gap-3 px-4 py-2.5 border-t border-slate-100 dark:border-slate-800 cursor-pointer ${locked ? "opacity-60" : ""}">
+          <input type="checkbox" data-field="r-perm" value="${p.id}" ${all || (d.permissions || []).includes(p.id) ? "checked" : ""} ${locked ? "disabled" : ""} class="w-5 h-5 accent-[#EA1B24]">
+          <span class="text-sm">${p.label}</span></label>`).join("")}
+      </div>`).join("");
+      const inUse = App.users.filter(u => (u.roleIds || []).includes(d.id)).length;
+      return App.appBar(isNew ? "Новая роль" : "Роль", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6 pb-28 space-y-4">
+        <div><label class="block text-sm font-medium mb-2">Название роли</label>
+          <input data-field="r-name" value="${Reports._esc(d.name || "")}" ${locked ? "disabled" : ""} placeholder="например, Территориальный управляющий"
+            class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm ${locked ? "opacity-60" : ""}"></div>
+        ${locked ? '<div class="p-3 rounded-xl bg-brand/5 border border-brand/20 text-[13px] text-slate-600 dark:text-slate-300">Системная роль администратора: имеет все права, изменить нельзя.</div>' : ""}
+        <div><label class="block text-sm font-medium mb-2">Права</label><div class="space-y-3">${groups}</div></div>
+        ${!isNew && !locked ? `<button data-action="adm-role-del" data-id="${d.id}" ${inUse ? "disabled" : ""} class="tnk-press w-full h-12 rounded-xl border border-brand/30 text-brand font-medium text-sm inline-flex items-center justify-center gap-2 ${inUse ? "opacity-50" : ""}">${UI.icon("trash", "w-4 h-4")}${inUse ? `Нельзя удалить — назначена (${inUse})` : "Удалить роль"}</button>` : ""}
+      </main>
+      <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
+        <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
+          <button data-route="settings" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отмена</button>
+          ${locked ? "" : `<button data-action="adm-role-save" class="tnk-press flex-[1.3] h-12 rounded-xl bg-brand text-white font-semibold text-sm">Сохранить</button>`}
+        </div></footer>`;
+    }
+  }
+};
+
+/* ===================== Auth (login -> welcome -> PIN 4-6) ===================== */
+const Auth = {
+  step: "login", loginVal: "", candidate: null, buffer: "", err: "",
+  reset() { Auth.step = "login"; Auth.loginVal = ""; Auth.candidate = null; Auth.buffer = ""; Auth.err = ""; },
+  screen() { return Auth.step === "pin" ? Auth._pinScreen() : Auth._loginScreen(); },
+
+  _loginScreen() {
+    return `<div class="min-h-dvh flex flex-col items-center justify-center px-6 py-10">
+      ${UI.logo("h-14 mb-8")}
+      <div class="text-[15px] font-medium text-slate-600 dark:text-slate-300 mb-6">Вход в систему</div>
+      <div class="w-full max-w-[300px]">
+        <label class="block text-sm font-medium mb-2" for="loginInput">Логин</label>
+        <input id="loginInput" data-field="auth-login" autocomplete="username" autocapitalize="none" spellcheck="false"
+          value="${Reports._esc(Auth.loginVal)}" placeholder="например, liliya"
+          class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">
+        <div role="alert" aria-live="polite" class="h-5 text-sm text-brand font-medium mt-2">${Auth.err}</div>
+        <button data-action="auth-next" class="tnk-press w-full h-12 rounded-xl bg-brand text-white font-semibold text-sm mt-2">Далее</button>
+      </div></div>`;
+  },
+
+  _pinScreen() {
+    const u = Auth.candidate;
+    const initials = (u.name || "?").trim().split(/\s+/).map(s => s[0]).slice(0, 2).join("").toUpperCase();
+    const avatar = u.photo
+      ? `<img src="${u.photo}" alt="" class="w-16 h-16 rounded-full object-cover mb-3">`
+      : `<div class="w-16 h-16 grid place-items-center rounded-full bg-brand text-white text-xl font-semibold mb-3">${initials}</div>`;
+    const dots = [0,1,2,3,4,5].map(i =>
+      `<div class="w-3 h-3 rounded-full transition-colors ${i < Auth.buffer.length ? "bg-brand" : "bg-slate-300 dark:bg-slate-700"}"></div>`).join("");
+    const ok = Auth.buffer.length >= 4;
+    const keys = ["1","2","3","4","5","6","7","8","9","⌫","0","✓"];
+    const pad = keys.map(k => {
+      if (k === "⌫") return `<button data-pin="⌫" aria-label="Стереть" class="tnk-press tnk-key h-16 rounded-2xl grid place-items-center text-slate-500 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">${UI.icon("backspace", "w-6 h-6")}</button>`;
+      if (k === "✓") return `<button data-pin="✓" aria-label="Войти" ${ok ? "" : "disabled"} class="tnk-press tnk-key h-16 rounded-2xl grid place-items-center border ${ok ? "bg-brand text-white border-brand" : "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-300 dark:text-slate-600"}">${UI.icon("check", "w-6 h-6")}</button>`;
+      return `<button data-pin="${k}" class="tnk-press tnk-key h-16 rounded-2xl text-2xl font-medium bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800">${k}</button>`;
+    }).join("");
+    return `<div class="min-h-dvh flex flex-col items-center justify-center px-6 py-10">
+      ${avatar}
+      <div class="text-sm text-slate-500 dark:text-slate-400">Добро пожаловать!</div>
+      <div class="font-semibold text-lg">${Reports._esc(u.name)}</div>
+      <div class="text-[13px] text-slate-500 dark:text-slate-400 mb-5">${Reports._esc(u.position || "")}</div>
+      <div class="flex gap-3 mb-2">${dots}</div>
+      <div role="alert" aria-live="polite" class="h-5 text-sm text-brand font-medium mb-4">${Auth.err}</div>
+      <div class="grid grid-cols-3 gap-3 w-full max-w-[300px]">${pad}</div>
+      <button data-action="auth-back" class="tnk-press mt-6 text-sm text-slate-500 dark:text-slate-400">← Другой пользователь</button>
+    </div>`;
+  },
+
+  next() {
+    const q = (Auth.loginVal || "").trim().toLowerCase();
+    if (!q) { Auth.err = "Введите логин"; App.render(); return; }
+    const u = App.users.find(x => (x.login || "").toLowerCase() === q && x.active);
+    if (!u) { Auth.err = "Пользователь не найден"; App.render(); return; }
+    Auth.candidate = u; Auth.step = "pin"; Auth.buffer = ""; Auth.err = "";
+    App.render();
+  },
+  back() { Auth.step = "login"; Auth.candidate = null; Auth.buffer = ""; Auth.err = ""; App.render(); },
+
+  pinPress(k) {
+    if (k === "✓") { Auth.submit(); return; }
+    if (k === "⌫") Auth.buffer = Auth.buffer.slice(0, -1);
+    else if (Auth.buffer.length < 6) Auth.buffer += k;
+    Auth.err = "";
+    if (Auth.buffer.length === 6) { Auth.submit(); return; }
+    App.render();
+  },
+  submit() {
+    if (Auth.buffer.length < 4) { Auth.err = "PIN — от 4 до 6 цифр"; App.render(); return; }
+    const u = Auth.candidate;
+    if (u && u.pin === Auth.buffer) {
+      App.user = u; Session.set({ userId: u.id, route: "home" });
+      Auth.reset(); App.route("home");
+    } else { Auth.buffer = ""; Auth.err = "Неверный PIN"; App.render(); }
+  }
+};
+
+/* ===================== Boot ===================== */
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", App.boot);
+else App.boot();
+
+/* Register service worker for PWA install + offline (ignored on file://) */
+if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
+}
+</script>
+</body>
+</html>
