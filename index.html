@@ -54,7 +54,7 @@ const APP_CONFIG = {
   version: "0.1.0",
   // Google Apps Script Web App URL — filled after backend deploy (Step 2)
   apiUrl: "https://script.google.com/macros/s/AKfycbw9tNUWHSVbHVNXyDdSJ6hN74HlbabeJDSyMmPL-88lcn_46aPPXEbKvODgs7fNxw/exec",
-  db: { name: "tanuki_audit", version: 5 }
+  db: { name: "tanuki_audit", version: 8 }
 };
 
 /* ---------- IndexedDB schema: stores, keyPath, indexes ---------- */
@@ -91,6 +91,11 @@ const DB_SCHEMA = {
   positions: { keyPath: "id", indexes: [ { name: "parentId", keyPath: "parentId", unique: false } ] },
   dispute_policies: { keyPath: "id" },
   report_access: { keyPath: "id", indexes: [ { name: "auditId", keyPath: "auditId", unique: false }, { name: "userId", keyPath: "userId", unique: false } ] },
+  concepts: { keyPath: "id", indexes: [ { name: "order", keyPath: "order", unique: false } ] },
+  checklist_versions: { keyPath: "id", indexes: [ { name: "deptId", keyPath: "deptId", unique: false }, { name: "ts", keyPath: "ts", unique: false } ] },
+  audit_log: { keyPath: "id", indexes: [ { name: "ts", keyPath: "ts", unique: false } ] },
+  notifications: { keyPath: "id", indexes: [ { name: "userId", keyPath: "userId", unique: false }, { name: "ts", keyPath: "ts", unique: false } ] },
+  schedules: { keyPath: "id", indexes: [ { name: "restaurantId", keyPath: "restaurantId", unique: false } ] },
   audits_history: {
     keyPath: "id",
     indexes: [
@@ -129,6 +134,9 @@ const VIO_STATUS = {
   OPEN: "open", FIX_SUBMITTED: "fix_submitted", RESOLVED: "resolved",
   DISPUTED: "disputed", DISPUTE_UPHELD: "dispute_upheld", DISPUTE_REJECTED: "dispute_rejected"
 };
+// Criticality mode per checkpoint: range = auditor picks penalty; fixed = locked; manager = auditor flags, manager sets %
+const SEVMODE = { RANGE: "range", FIXED: "fixed", MANAGER: "manager" };
+const SEVMODE_LABEL = { range: "Аудитор выбирает", fixed: "Фиксированный штраф", manager: "Оценку ставит руководитель" };
 
 /* Permission catalog — grouped checkboxes admin toggles into roles. "*" = all. */
 const PERMISSION_GROUPS = [
@@ -148,11 +156,13 @@ const PERMISSION_GROUPS = [
   { group: "Задачи и оспаривания", perms: [
     { id: "task.assign",     label: "Назначать ответственных" },
     { id: "task.resolve",    label: "Закрывать нарушения" },
+    { id: "score.override",  label: "Ставить оценку вручную (0–100%)" },
     { id: "dispute.raise",   label: "Оспаривать нарушения" },
     { id: "dispute.approve", label: "Согласовывать оспаривания" }
   ] },
   { group: "Администрирование", perms: [
     { id: "checklist.edit", label: "Редактировать чек-листы" },
+    { id: "users.createLogin", label: "Заводить сотрудников (в своей зоне)" },
     { id: "users.manage",   label: "Управление пользователями" },
     { id: "roles.manage",   label: "Управление ролями" },
     { id: "geo.manage",     label: "Управление географией" },
@@ -729,6 +739,24 @@ const DB = {
   access()      { return IDB.getAll("report_access"); },
   saveAccess(g) { return IDB.put("report_access", g); },
   delAccess(id) { return IDB.del("report_access", id); },
+  concepts()    { return IDB.getAll("concepts").then(c => c.sort((a, b) => (a.order || 0) - (b.order || 0))); },
+  saveConcept(c){ return IDB.put("concepts", c); },
+  delConcept(id){ return IDB.del("concepts", id); },
+  saveDept(d)   { return IDB.put("departments", d); },
+  delDept(id)   { return IDB.del("departments", id); },
+  saveCategory(c) { return IDB.put("checklist_categories", c); },
+  delCategory(id) { return IDB.del("checklist_categories", id); },
+  saveCheckpoint(c) { return IDB.put("checklist_structure", c); },
+  delCheckpoint(id) { return IDB.del("checklist_structure", id); },
+  logVersion(v) { return IDB.put("checklist_versions", v); },
+  versions(deptId) { return IDB.byIndex("checklist_versions", "deptId", deptId); },
+  logAction(l)  { return IDB.put("audit_log", l); },
+  auditLog()    { return IDB.getAll("audit_log"); },
+  notifyPut(n)  { return IDB.put("notifications", n); },
+  notifications(userId) { return IDB.byIndex("notifications", "userId", userId); },
+  schedules()   { return IDB.getAll("schedules"); },
+  saveSchedule(s) { return IDB.put("schedules", s); },
+  delSchedule(id) { return IDB.del("schedules", id); },
   departments() { return IDB.getAll("departments").then(d => d.sort((a,b)=>a.order-b.order)); },
   penalties()   { return IDB.getAll("penalties").then(p => p.sort((a, b) => a.percent - b.percent)); },
   orgRoles()    { return IDB.getAll("orgRoles").then(r => r.sort((a,b)=>a.order-b.order)); },
@@ -905,17 +933,28 @@ const Audit = {
       finishedAt: null, scores: {}, finalScore: null
     };
     await Audit._loadData(deptIds);
+    // Freeze the checklist version into the audit (immutability — old audits keep their structure)
+    Audit.active.checklist = {};
+    deptIds.forEach(id => { Audit.active.checklist[id] = { categories: Audit.data.categories[id] || [], checkpoints: Audit.data.checkpoints[id] || [] }; });
     Audit.data.violations = [];
     Audit.ui = { deptId: deptIds[0], openCat: null };
     await DB.saveAudit(Audit.active);
     App.route("audit_run");
   },
 
+  // Populate Audit.data from the frozen snapshot if present, else load live (legacy audits)
+  async _hydrate(a) {
+    if (a.checklist) {
+      Audit.data.categories = {}; Audit.data.checkpoints = {};
+      (a.deptIds || []).forEach(id => { const s = a.checklist[id] || {}; Audit.data.categories[id] = s.categories || []; Audit.data.checkpoints[id] = s.checkpoints || []; });
+    } else await Audit._loadData(a.deptIds);
+  },
+
   async resume(id) {
     const a = await IDB.get("audits_history", id);
     if (!a) return;
     Audit.active = a;
-    await Audit._loadData(a.deptIds);
+    await Audit._hydrate(a);
     Audit.data.violations = await DB.violations(id);
     Audit.ui = { deptId: a.deptIds[0], openCat: null };
     if (a.status === AUDIT_STATUS.PAUSED) { a.status = AUDIT_STATUS.IN_PROGRESS; await DB.saveAudit(a); }
@@ -1073,6 +1112,46 @@ const Reports = {
     window.XLSX.writeFile(wb, Reports.fname(m, "xlsx"));
   },
 
+  _csv(rows) { return "﻿" + rows.map(r => r.map(v => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`).join(";")).join("\r\n"); },
+  async exportAuditCSV() {
+    const m = await Reports.current();
+    const rows = [["Ресторан", m.restaurant || "—"], ["Аудитор", m.auditor], ["Дата", m.date], ["Охват", m.scope], ["Итог %", m.finalScore], [],
+      ["Подразделение", "Индекс", "Объект", "Критерий", "Тип", "Штраф %", "Комментарий", "Ответственный", "Время"]];
+    m.violations.forEach(v => rows.push([v.deptName, v.index, v.object, v.criterion, v.severity === SEVERITY.CRITICAL ? "Критично" : "Некритично", v.penalty, v.comment, v.assignee, v.time]));
+    Reports._download(Reports.fname(m, "csv"), new Blob([Reports._csv(rows)], { type: "text/csv;charset=utf-8" }));
+  },
+  exportTasksCSV() {
+    const list = App.filteredTasks();
+    const roleTitle = (id) => (App._orgRoles.find(r => r.id === id) || {}).title || "";
+    const st = { open: "Открыто", fix_submitted: "На проверке", dispute_rejected: "Оспаривание отклонено" };
+    const rows = [["Объект", "Ресторан", "Подразделение", "Ответственный", "Статус", "Срок", "Просрочено", "Повтор"]];
+    list.forEach(t => rows.push([t.object, t.a.restaurant || "", App.deptName(t.v.deptId), roleTitle(t.v.assigneeRole), st[t.v.status] || t.v.status, t.v.deadline || "бессрочно", App._isOverdue(t.v) ? "да" : "", t.repeat > 1 ? t.repeat : ""]));
+    Reports._download("Задачи_" + new Date().toISOString().slice(0, 10) + ".csv", new Blob([Reports._csv(rows)], { type: "text/csv;charset=utf-8" }));
+  },
+
+  // Export a department's checklist as a standard (Excel with 2 sheets + CSV fallback)
+  async exportChecklist(deptId) {
+    const cats = (await DB.categories(deptId)).sort((a, b) => Number(a.code) - Number(b.code));
+    const checks = (await DB.checkpoints(deptId)).sort((a, b) => { const pa = String(a.index).split(".").map(Number), pb = String(b.index).split(".").map(Number); return (pa[0] - pb[0]) || ((pa[1] || 0) - (pb[1] || 0)); });
+    const depName = (App._departments.find(d => d.id === deptId) || {}).name || deptId;
+    const catName = {}; cats.forEach(c => catName[c.id] = c.name);
+    const modeTxt = (cp) => SEVMODE_LABEL[cp.severityMode || SEVMODE.RANGE] + (cp.severityMode === SEVMODE.FIXED ? " " + (cp.fixedPenalty || 0) + "%" : "");
+    if (!window.XLSX) { // CSV fallback
+      const rows = [["Категория", "Вес %", "Индекс", "Объект", "Критерий", "Требование", "Режим оценки"]];
+      checks.forEach(cp => { const c = cats.find(x => x.id === cp.categoryId) || {}; rows.push([c.name || "", c.weight || "", cp.index || "", cp.object || "", cp.criterion || "", cp.requirement || "", modeTxt(cp)]); });
+      const csv = "﻿" + rows.map(r => r.map(v => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`).join(";")).join("\r\n");
+      Reports._download("Чеклист_" + depName + ".csv", new Blob([csv], { type: "text/csv;charset=utf-8" }));
+      return;
+    }
+    const catSheet = [["Категория", "Вес %"]]; cats.forEach(c => catSheet.push([c.name, c.weight]));
+    const cpSheet = [["Категория", "Индекс", "Объект", "Критерий", "Требование", "Режим оценки"]];
+    checks.forEach(cp => cpSheet.push([catName[cp.categoryId] || "", cp.index || "", cp.object || "", cp.criterion || "", cp.requirement || "", modeTxt(cp)]));
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, window.XLSX.utils.aoa_to_sheet(catSheet), "Категории");
+    window.XLSX.utils.book_append_sheet(wb, window.XLSX.utils.aoa_to_sheet(cpSheet), "Пункты");
+    window.XLSX.writeFile(wb, ("Чеклист_" + depName + ".xlsx").replace(/\s+/g, "_"));
+  },
+
   // Period / filtered statistics export (uses App.hist filtered set)
   async exportPeriod() {
     if (!window.XLSX) { alert("Библиотека Excel ещё не загрузилась (нужен интернет при первом запуске)."); return; }
@@ -1131,7 +1210,7 @@ const History = {
   async openItem(id) {
     const a = await IDB.get("audits_history", id); if (!a) return;
     Audit.active = a;
-    await Audit._loadData(a.deptIds);
+    await Audit._hydrate(a);
     Audit.data.violations = await DB.violations(id);
     App.route("audit_done");
   },
@@ -1188,7 +1267,10 @@ const ICONS = {
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
   inbox: '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
   gauge: '<path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/><circle cx="12" cy="14" r="1.5"/>',
-  share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/>'
+  share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/>',
+  bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+  search: '<circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/>',
+  save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>'
 };
 const UI = {
   icon(name, cls) {
@@ -1237,13 +1319,18 @@ const VForm = {
     App.route("violation");
   },
   newDraft(deptId, checkpointId) {
-    const def = VForm.penalties[0] || { id: null, percent: 0 };
+    const cp = (Audit.data.checkpoints[deptId] || []).find(c => c.id === checkpointId) || {};
+    const mode = cp.severityMode || SEVMODE.RANGE;
+    let penaltyId = null, penaltyPercent = 0, pendingScore = false;
+    if (mode === SEVMODE.FIXED) { penaltyPercent = Number(cp.fixedPenalty) || 0; }
+    else if (mode === SEVMODE.MANAGER) { pendingScore = true; }
+    else { const def = VForm.penalties[0] || { id: null, percent: 0 }; penaltyId = def.id; penaltyPercent = def.percent; }
     VForm.draft = {
       id: "vio_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6),
-      auditId: Audit.active.id, deptId, checkpointId,
-      severity: SEVERITY.NON_CRITICAL, penaltyId: def.id, penaltyPercent: def.percent,
+      auditId: Audit.active.id, deptId, checkpointId, severityMode: mode,
+      severity: SEVERITY.NON_CRITICAL, penaltyId, penaltyPercent, pendingScore,
       assigneeRole: "", comment: "", createdAt: new Date().toISOString(),
-      status: VIO_STATUS.OPEN, dispute: null,
+      status: VIO_STATUS.OPEN, dispute: null, deadline: "",
       photos: [], markers: [], thread: []
     };
   },
@@ -1415,8 +1502,9 @@ const Workflow = {
     if (!a) return;
     const scores = {};
     for (const deptId of a.deptIds) {
-      const cats = await DB.categories(deptId);
-      const struct = await DB.checkpoints(deptId);
+      // Use the audit's frozen checklist snapshot (not live), for immutability
+      const cats = (a.checklist && a.checklist[deptId] ? a.checklist[deptId].categories : Audit.data.categories[deptId]) || [];
+      const struct = (a.checklist && a.checklist[deptId] ? a.checklist[deptId].checkpoints : Audit.data.checkpoints[deptId]) || [];
       const vios = Audit.data.violations.filter(v => v.deptId === deptId && v.status !== VIO_STATUS.DISPUTE_UPHELD);
       const catScores = Scoring.categoryScores(cats, struct, vios);
       scores[deptId] = { categories: catScores, score: Scoring.deptScore(cats, catScores) };
@@ -1433,7 +1521,9 @@ const Workflow = {
     v.thread = v.thread || []; v.thread.push(Workflow._entry("fix", text));
     if (v.status === VIO_STATUS.OPEN || v.status === VIO_STATUS.DISPUTE_REJECTED) v.status = VIO_STATUS.FIX_SUBMITTED;
     Workflow.ctx.composerPhotos = []; Workflow.ctx.wfText = "";
-    await Workflow._save(); App.render();
+    await Workflow._save();
+    App.notify((Audit.active || {}).auditorId, "Подано исправление · " + ((Audit.active || {}).restaurant || "аудит"), { type: "vio", auditId: Workflow.ctx.auditId, vioId: v.id });
+    App.render();
   },
   async resolve() {
     const v = Workflow.ctx.vio;
@@ -1447,6 +1537,15 @@ const Workflow = {
     v.status = VIO_STATUS.OPEN;
     await Workflow._save(); App.render();
   },
+  async setScore() {
+    const v = Workflow.ctx.vio;
+    const val = prompt("Оценка нарушения — штраф в % (0–100). 100% обнуляет категорию:", v.penaltyPercent || 0);
+    if (val === null) return;
+    const p = Math.max(0, Math.min(100, Number(val) || 0));
+    v.penaltyPercent = p; v.pendingScore = false; v.penaltyId = null;
+    v.thread = v.thread || []; v.thread.push({ author: THREAD_AUTHOR.SYSTEM, name: App.user.name, kind: "decision", text: "Установлена оценка: −" + p + "%", photos: [], ts: new Date().toISOString() });
+    await Workflow._save(); App.log("Ручная оценка нарушения", "−" + p + "%"); App.render();
+  },
   async raiseDispute(text) {
     if (!text.trim()) { alert("Опишите причину оспаривания."); return; }
     const v = Workflow.ctx.vio;
@@ -1454,7 +1553,12 @@ const Workflow = {
     v.dispute = { raisedBy: App.user.id, raisedByName: App.user.name, reason: text, ts: new Date().toISOString(), votes: [] };
     v.status = VIO_STATUS.DISPUTED;
     Workflow.ctx.composerPhotos = []; Workflow.ctx.wfText = "";
-    await Workflow._save(); App.render();
+    await Workflow._save();
+    // notify approvers (policy list, else all dispute.approve holders)
+    const pol = Workflow.getPolicy(Audit.active);
+    const approverIds = pol ? pol.approvers.map(a => a.userId) : App.users.filter(u => { const p = App.effectivePerms(u); return p.has("*") || p.has("dispute.approve"); }).map(u => u.id);
+    for (const uid of approverIds) App.notify(uid, "Оспаривание требует согласования · " + ((Audit.active || {}).restaurant || ""), { type: "vio", auditId: Workflow.ctx.auditId, vioId: v.id });
+    App.render();
   },
   async voteDispute(approve, comment) {
     const v = Workflow.ctx.vio;
@@ -1490,7 +1594,11 @@ const App = {
       App._orgRoles = await DB.orgRoles();
       App._policies = await DB.policies();
       App._access = await DB.access();
+      App._concepts = await DB.concepts();
+      App._departments = await DB.departments();
+      App._catCount = {}; (await IDB.getAll("checklist_categories")).forEach(c => App._catCount[c.deptId] = (App._catCount[c.deptId] || 0) + 1);
       if (Session.data.userId) App.user = App.users.find(u => u.id === Session.data.userId) || null;
+      if (App.user) { await App.refreshNotif(); App.autoBackupCheck(); }
       App.route(App.user ? (Session.data.route === "login" ? "home" : Session.data.route) : "login");
     } catch (e) {
       App.el.innerHTML = App._splash("Ошибка инициализации: " + e.message);
@@ -1554,10 +1662,27 @@ const App = {
       case "export-pdf":   Reports.exportPDF(); return;
       case "export-excel": Reports.exportExcel(); return;
       case "export-html":  Reports.exportHTML(); return;
+      case "export-csv":   Reports.exportAuditCSV(); return;
+      case "export-tasks-csv": Reports.exportTasksCSV(); return;
       case "share-open": App.openShare(d.id); return;
       case "share-save": App.saveShare(); return;
+      case "ack-request": App.ackRequest(App.ackPick); return;
+      case "ack-delegate": App.ackDelegate(App.ackPick); return;
+      case "ack-confirm": App.ackConfirm(); return;
       case "history": App.openHistory(); return;
       case "dashboard": App.openDashboard(); return;
+      case "tasks": App.openTasks(); return;
+      case "search": App.openSearch(); App._after = () => { const s = document.getElementById("searchInput"); if (s) s.focus(); }; return;
+      case "schedule": App.openSchedule(); return;
+      case "open-notifications": App.openNotifications(); return;
+      case "notif-open": App.notifOpen(d.id); return;
+      case "notif-read-all": App.notifReadAll(); return;
+      case "open-journal": DB.auditLog().then(l => { App._journal = l.sort((a, b) => (a.ts < b.ts ? 1 : -1)); App.route("journal"); }); return;
+      case "backup-export": App.backupExport(); return;
+      case "backup-import": { const el = document.getElementById("backupInput"); if (el) el.click(); return; }
+      case "task-open": App.openVioFrom(d.audit, d.vio); return;
+      case "tasks-filter-toggle": App.taskFilterOpen = !App.taskFilterOpen; App.render(); return;
+      case "tasks-reset": App.taskFilter = { restaurant: "", dept: "", assignee: "", status: "", overdue: false }; App.render(); return;
       case "wf-open-ctx": App.openVioFrom(d.audit, d.vio); return;
       case "open-history-item": History.openItem(d.id); return;
       case "del-audit": App.deleteAudit(d.id); return;
@@ -1567,6 +1692,9 @@ const App = {
       // admin: users & roles
       case "adm-user-new": App.admUserNew(); return;
       case "adm-user-edit": App.admUserEdit(d.id); return;
+      case "staff": App.openStaff(); return;
+      case "adm-staff-new": App.admStaffNew(); return;
+      case "adm-staff-edit": App.admStaffEdit(d.id); return;
       case "adm-user-save": App.admUserSave(); return;
       case "adm-user-del": App.admUserDel(d.id); return;
       case "adm-user-photo": { const el = document.getElementById("uPhotoInput"); if (el) el.click(); return; }
@@ -1578,8 +1706,27 @@ const App = {
       // admin: geo & positions
       case "geo-add": App.geoAdd(d.parent || null, d.type); return;
       case "geo-del": App.geoDel(d.id); return;
-      case "pos-add": App.posAdd(d.parent || null); return;
+      case "concept-add": App.conceptAdd(); return;
+      case "concept-del": App.conceptDel(d.id); return;
+      case "dept-add": App.deptAdd(); return;
+      case "dept-del": App.deptDel(d.id, !!d.has); return;
+      case "pos-new": App.posNew(d.parent || null); return;
+      case "pos-edit": App.posEdit(d.id); return;
+      case "pos-save": App.posSave(); return;
       case "pos-del": App.posDel(d.id); return;
+      case "open-constructor": App.openConstructor(); return;
+      case "ctr-dept": App.ctrLoad(d.id).then(() => App.render()); return;
+      case "ctr-cat-new": App.ctrCatNew(); return;
+      case "ctr-cat-edit": App.ctrCatEdit(d.id); return;
+      case "ctr-cat-save": App.ctrCatSave(); return;
+      case "ctr-cat-del": App.ctrCatDel(d.id); return;
+      case "ctr-cp-new": App.ctrCpNew(d.cat); return;
+      case "ctr-cp-edit": App.ctrCpEdit(d.id); return;
+      case "ctr-cp-save": App.ctrCpSave(); return;
+      case "ctr-cp-del": App.ctrCpDel(d.id); return;
+      case "cp-mode": App.ctr.cpDraft.severityMode = d.val; App.render(); return;
+      case "ctr-history": App.openCtrHistory(); return;
+      case "ctr-export": Reports.exportChecklist(App.ctr.deptId); return;
       case "pol-list": App.route("policies"); return;
       case "pol-edit": App.admPolicyEdit(d.id); return;
       case "pol-save": App.admPolicySave(); return;
@@ -1603,6 +1750,7 @@ const App = {
       case "wf-reject": Workflow.rejectFix(); return;
       case "wf-vote-approve": Workflow.voteDispute(true, ""); return;
       case "wf-vote-reject": Workflow.voteDispute(false, ""); return;
+      case "wf-set-score": Workflow.setScore(); return;
       // photo editor
       case "pe-tool": PhotoEdit.tool = d.val; App.render(); return;
       case "pe-undo": PhotoEdit.undo(); return;
@@ -1617,13 +1765,22 @@ const App = {
     if (el.id === "photoInput") { App.handlePhotos(el.files); return; }
     if (el.id === "uPhotoInput") { App.admUserPhoto(el.files); return; }
     if (el.id === "wfPhotoInput") { App.handleWfPhotos(el.files); return; }
+    if (el.id === "backupInput") { App.backupImport(el.files[0]); return; }
+    if (d.field === "sched-days") { App.schedSet(el.dataset.id, el.value); return; }
     if (d.field === "setup-restaurant") { App.setup.restaurantId = el.value; return; }
+    if (d.field === "rest-concept") { App.setRestaurantConcept(el.dataset.id, el.value).then(() => App.render()); return; }
     if (d.field && d.field.indexOf("hf-") === 0) {
       const map = { "hf-from": "from", "hf-to": "to", "hf-auditor": "auditorId", "hf-restaurant": "restaurantId", "hf-dept": "deptId", "hf-assignee": "assignee" };
       App.histFilter[map[d.field]] = el.value; App.applyHistFilter(true); return;
     }
+    if (d.field && d.field.indexOf("tf-") === 0) {
+      const map = { "tf-restaurant": "restaurant", "tf-dept": "dept", "tf-assignee": "assignee", "tf-status": "status" };
+      if (d.field === "tf-overdue") App.taskFilter.overdue = el.checked; else App.taskFilter[map[d.field]] = el.value;
+      App.render(); return;
+    }
     if (d.field === "penalty")  { VForm.setPenalty(el.value); App.render(); return; }
     if (d.field === "assignee") { VForm.draft.assigneeRole = el.value; return; }
+    if (d.field === "vdeadline") { VForm.draft.deadline = el.value; return; }
     if (d.field === "u-role") {
       const set = new Set(App.adm.uDraft.roleIds || []);
       el.checked ? set.add(el.value) : set.delete(el.value);
@@ -1631,15 +1788,28 @@ const App = {
     }
     if (d.field === "u-active") { App.adm.uDraft.active = el.checked; return; }
     if (d.field === "share-user") { App.toggleShareUser(el.value, el.checked); return; }
+    if (d.field === "ack-user") { App.ackPick = el.value; return; }
     if (d.field === "u-positionId") {
       const p = App._positions.find(x => x.id === el.value);
       App.adm.uDraft.positionId = el.value || null;
-      App.adm.uDraft.position = p ? p.title : ""; return;
+      App.adm.uDraft.position = p ? p.title : "";
+      App.applyPositionDefaults(); App.render(); return;
     }
+    if (d.field === "u-perm") { App.toggleUserPerm(el.value, el.checked); return; }
     if (d.field === "u-scope") {
       const set = new Set(App.adm.uDraft.scope || []);
       el.checked ? set.add(el.value) : set.delete(el.value);
       App.adm.uDraft.scope = Array.from(set); return;
+    }
+    if (d.field === "u-concept") {
+      const set = new Set(App.adm.uDraft.conceptIds || []);
+      el.checked ? set.add(el.value) : set.delete(el.value);
+      App.adm.uDraft.conceptIds = Array.from(set); return;
+    }
+    if (d.field === "u-dept") {
+      const set = new Set(App.adm.uDraft.deptIds || []);
+      el.checked ? set.add(el.value) : set.delete(el.value);
+      App.adm.uDraft.deptIds = Array.from(set); return;
     }
     if (d.field === "r-perm") {
       const r = App.adm.rDraft;
@@ -1647,20 +1817,36 @@ const App = {
       el.checked ? set.add(el.value) : set.delete(el.value);
       r.permissions = Array.from(set); return;
     }
+    if (d.field === "pos-role") {
+      const set = new Set(App.adm.posDraft.roleIds || []);
+      el.checked ? set.add(el.value) : set.delete(el.value);
+      App.adm.posDraft.roleIds = Array.from(set); return;
+    }
     if (d.field === "pol-approver") { App._polApprover(el.value, el.checked); return; }
     if (d.field === "pol-override") { App._polField(el.dataset.uid, "canOverride", el.checked); return; }
     if (d.field === "pol-threshold") { App.adm.pDraft.threshold = Number(el.value); App.render(); return; }
+    if (d.field === "cat-weight") { App.ctr.catDraft.weight = Number(el.value); App.render(); return; }
+    if (d.field === "cp-fixed") { App.ctr.cpDraft.fixedPenalty = Number(el.value); App.render(); return; }
   },
   _onInput(e) {
     const el = e.target; const d = el.dataset || {};
     if (d.field === "comment") { VForm.draft.comment = el.value; return; }
     if (d.field === "wf-text") { Workflow.ctx.wfText = el.value; return; }
     if (d.field === "auth-login") { Auth.loginVal = el.value; return; }
+    if (d.field === "user-search") { App.adm.userQuery = el.value; App._after = () => { const s = document.getElementById("userSearch"); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }; App.render(); return; }
+    if (d.field === "staff-search") { App.adm.staffQuery = el.value; App._after = () => { const s = document.getElementById("staffSearch"); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }; App.render(); return; }
+    if (d.field === "search-q") { App.searchQuery = el.value; App.doSearch(el.value).then(() => { App._after = () => { const s = document.getElementById("searchInput"); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }; App.render(); }); return; }
     if (d.field === "u-name")     { App.adm.uDraft.name = el.value; return; }
     if (d.field === "u-login")    { App.adm.uDraft.login = el.value; return; }
     if (d.field === "u-position") { App.adm.uDraft.position = el.value; return; }
     if (d.field === "u-pin")      { el.value = el.value.replace(/\D/g, "").slice(0, 6); App.adm.uDraft.pin = el.value; return; }
     if (d.field === "r-name")     { App.adm.rDraft.name = el.value; return; }
+    if (d.field === "pos-title")  { App.adm.posDraft.title = el.value; return; }
+    if (d.field === "cat-name")   { App.ctr.catDraft.name = el.value; return; }
+    if (d.field === "cp-index")   { App.ctr.cpDraft.index = el.value; return; }
+    if (d.field === "cp-object")  { App.ctr.cpDraft.object = el.value; return; }
+    if (d.field === "cp-criterion") { App.ctr.cpDraft.criterion = el.value; return; }
+    if (d.field === "cp-req")     { App.ctr.cpDraft.requirement = el.value; return; }
     if (d.field === "pol-weight") { App._polField(el.dataset.uid, "weight", Math.max(1, Number(el.value) || 1)); return; }
   },
 
@@ -1699,13 +1885,9 @@ const App = {
       .filter(a => a.status === AUDIT_STATUS.IN_PROGRESS || a.status === AUDIT_STATUS.PAUSED)
       .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
     App.setup.scope = "single"; App.setup.selDept = null;
-    // Restaurants available to this auditor (scope-limited unless empty scope)
-    App._geo = await DB.geoNodes();
-    let rests = App._geo.filter(n => n.type === "restaurant");
-    if ((App.user.scope || []).length) {
-      const allowed = Geo.restaurantsUnder(App._geo, App.user.scope);
-      rests = rests.filter(r => allowed.has(r.id));
-    }
+    // Restaurants available to this auditor (concept + geo axes; empty = all)
+    App._geo = await DB.geoNodes(); App._concepts = await DB.concepts();
+    const rests = App.myRestaurants();
     App.setup.restaurants = rests;
     App.setup.restaurantId = rests.length === 1 ? rests[0].id : "";
     App.route("audit_setup");
@@ -1780,15 +1962,33 @@ const App = {
   },
   resetHistFilter() { App.histFilter = { from: "", to: "", auditorId: "", restaurantId: "", deptId: "", assignee: "" }; App.applyHistFilter(true); },
 
+  // Multi-axis scope check: concept + geo(subtree) + department. Empty axis = no restriction.
+  conceptOfRestaurant(restId) { const r = App._geo.find(n => n.id === restId); return r ? (r.conceptId || null) : null; },
+  inScope(audit) {
+    const u = App.user || {};
+    const concepts = u.conceptIds || [], geo = u.scope || [], depts = u.deptIds || [];
+    if (concepts.length) { const cid = App.conceptOfRestaurant(audit.restaurantId); if (!cid || !concepts.includes(cid)) return false; }
+    if (geo.length) { const allowed = Geo.restaurantsUnder(App._geo, geo); if (!(audit.restaurantId && allowed.has(audit.restaurantId))) return false; }
+    if (depts.length) { if (!(audit.deptIds || []).some(x => depts.includes(x))) return false; }
+    return true;
+  },
+  // Restaurants the current user may see/audit (concept + geo axes). Empty scope = all.
+  myRestaurants() {
+    let rests = App._geo.filter(n => n.type === "restaurant");
+    const u = App.user || {};
+    if ((u.conceptIds || []).length) rests = rests.filter(r => (u.conceptIds).includes(r.conceptId));
+    if ((u.scope || []).length) { const allowed = Geo.restaurantsUnder(App._geo, u.scope); rests = rests.filter(r => allowed.has(r.id)); }
+    return rests;
+  },
+  _sharedWith(a) { return (App._access || []).some(g => g.auditId === a.id && g.userId === App.user.id); },
   // Shared scope filter used by History + Dashboard
   visibleAudits(audits) {
     const perms = App.myPerms();
     if (perms.has("*") || perms.has("audit.viewAll")) return audits;
-    if (perms.has("audit.viewScope") && (App.user.scope || []).length) {
-      const allowed = Geo.restaurantsUnder(App._geo, App.user.scope);
-      return audits.filter(a => a.auditorId === App.user.id || (a.restaurantId && allowed.has(a.restaurantId)) || (App._access || []).some(g => g.auditId === a.id && g.userId === App.user.id));
+    if (perms.has("audit.viewScope")) {
+      return audits.filter(a => a.auditorId === App.user.id || App.inScope(a) || App._sharedWith(a));
     }
-    return audits.filter(a => a.auditorId === App.user.id || (App._access || []).some(g => g.auditId === a.id && g.userId === App.user.id));
+    return audits.filter(a => a.auditorId === App.user.id || App._sharedWith(a));
   },
 
   dash: { avg: null, count: 0, resolveQueue: [], voteQueue: [], attention: [], recent: [] },
@@ -1817,6 +2017,167 @@ const App = {
     Workflow.open(auditId, vioId);
   },
 
+  /* ---- Tasks (corrective actions with deadlines / overdue / repeat) ---- */
+  taskRaw: [],
+  taskFilter: { restaurant: "", dept: "", assignee: "", status: "", overdue: false },
+  OPEN_STATES: ["open", "fix_submitted", "dispute_rejected"],
+  _objectOf(v, audit, cpMap) {
+    if (audit && audit.checklist && audit.checklist[v.deptId]) {
+      const c = (audit.checklist[v.deptId].checkpoints || []).find(x => x.id === v.checkpointId);
+      if (c) return c.object;
+    }
+    return (cpMap[v.checkpointId] || {}).object || "—";
+  },
+  async openTasks() {
+    let audits = (await DB.audits()).filter(a => a.status === AUDIT_STATUS.COMPLETED);
+    audits = App.visibleAudits(audits);
+    const byId = {}; audits.forEach(a => byId[a.id] = a);
+    const idset = new Set(audits.map(a => a.id));
+    const allVios = (await IDB.getAll("audit_violations")).filter(v => idset.has(v.auditId));
+    const cpMap = {}; (await IDB.getAll("checklist_structure")).forEach(c => cpMap[c.id] = c);
+    // repeat occurrences: same restaurant + object across audits
+    const occ = {};
+    allVios.forEach(v => { const a = byId[v.auditId]; const key = (a.restaurantId || "") + "|" + App._objectOf(v, a, cpMap); (occ[key] = occ[key] || new Set()).add(v.auditId); });
+    App.taskRaw = allVios.filter(v => App.OPEN_STATES.includes(v.status || "open")).map(v => {
+      const a = byId[v.auditId]; const obj = App._objectOf(v, a, cpMap);
+      return { v, a, object: obj, repeat: (occ[(a.restaurantId || "") + "|" + obj] || new Set()).size };
+    });
+    App.taskFilter = { restaurant: "", dept: "", assignee: "", status: "", overdue: false };
+    App.route("tasks");
+  },
+  _isOverdue(v) { return v.deadline && new Date(v.deadline + "T23:59:59").getTime() < Date.now(); },
+  filteredTasks() {
+    const f = App.taskFilter;
+    return App.taskRaw.filter(t => {
+      if (f.restaurant && t.a.restaurantId !== f.restaurant) return false;
+      if (f.dept && t.v.deptId !== f.dept) return false;
+      if (f.assignee && t.v.assigneeRole !== f.assignee) return false;
+      if (f.status && (t.v.status || "open") !== f.status) return false;
+      if (f.overdue && !App._isOverdue(t.v)) return false;
+      return true;
+    });
+  },
+  taskActiveFilters() { const f = App.taskFilter; return [f.restaurant, f.dept, f.assignee, f.status, f.overdue].filter(Boolean).length; },
+
+  /* ---- Acknowledgment (sign-off), delegable down the hierarchy ---- */
+  ackPick: "",
+  async _ackSave() { await DB.saveAudit(Audit.active); Sync.enqueue(Audit.active.id); if (App.user) App.render(); },
+  async ackRequest(userId) {
+    const u = App.users.find(x => x.id === userId); if (!u) { alert("Выберите сотрудника."); return; }
+    Audit.active.acknowledgment = { assignedToId: u.id, assignedToName: u.name, status: "pending", requestedById: App.user.id, requestedByName: App.user.name, ts: new Date().toISOString() };
+    App.notify(u.id, "Отчёт направлен вам на ознакомление · " + (Audit.active.restaurant || ""), { type: "audit", auditId: Audit.active.id });
+    App.ackPick = ""; await App._ackSave();
+  },
+  async ackDelegate(userId) {
+    const u = App.users.find(x => x.id === userId); if (!u) { alert("Выберите сотрудника."); return; }
+    const a = Audit.active.acknowledgment || {};
+    a.assignedToId = u.id; a.assignedToName = u.name; a.status = "pending"; a.delegatedById = App.user.id; a.delegatedByName = App.user.name; a.ts = new Date().toISOString();
+    Audit.active.acknowledgment = a; App.notify(u.id, "Вам передан отчёт на ознакомление · " + (Audit.active.restaurant || ""), { type: "audit", auditId: Audit.active.id }); App.ackPick = ""; await App._ackSave();
+  },
+  async ackConfirm() {
+    const a = Audit.active.acknowledgment || {};
+    a.status = "done"; a.confirmedById = App.user.id; a.confirmedByName = App.user.name; a.confirmedTs = new Date().toISOString();
+    Audit.active.acknowledgment = a; await App._ackSave();
+  },
+
+  /* ===================== D5: audit log, notifications, backup, schedule, search ===================== */
+  async log(action, detail) {
+    try { await DB.logAction({ id: "log_" + Date.now() + "_" + Math.random().toString(36).slice(2, 5), ts: new Date().toISOString(), actor: App.user ? App.user.name : "система", action, detail: detail || "" }); } catch (e) {}
+  },
+  async notify(userId, text, link) {
+    if (!userId || (App.user && userId === App.user.id)) return; // don't notify self
+    try { await DB.notifyPut({ id: "ntf_" + Date.now() + "_" + Math.random().toString(36).slice(2, 5), userId, ts: new Date().toISOString(), text, link: link || null, read: false }); } catch (e) {}
+  },
+  async refreshNotif() {
+    if (!App.user) { App._notifUnread = 0; return; }
+    const list = await DB.notifications(App.user.id);
+    App._notif = list.sort((a, b) => (a.ts < b.ts ? 1 : -1));
+    App._notifUnread = list.filter(n => !n.read).length;
+  },
+  async openNotifications() { await App.refreshNotif(); App.route("notifications"); },
+  async notifOpen(id) {
+    const n = (App._notif || []).find(x => x.id === id); if (!n) return;
+    if (!n.read) { n.read = true; await DB.notifyPut(n); }
+    if (n.link && n.link.type === "vio") return App.openVioFrom(n.link.auditId, n.link.vioId);
+    if (n.link && n.link.type === "audit") return History.openItem(n.link.auditId);
+    await App.refreshNotif(); App.render();
+  },
+  async notifReadAll() { for (const n of (App._notif || [])) if (!n.read) { n.read = true; await DB.notifyPut(n); } await App.refreshNotif(); App.render(); },
+
+  // Backup: full JSON export / import
+  async backupExport() {
+    const dump = { _meta: { app: "TanukiAudit", ts: new Date().toISOString(), dbVersion: APP_CONFIG.db.version } };
+    for (const name of Object.keys(DB_SCHEMA)) { try { dump[name] = await IDB.getAll(name); } catch (e) { dump[name] = []; } }
+    Reports._download("tanuki_backup_" + new Date().toISOString().slice(0, 10) + ".json", new Blob([JSON.stringify(dump)], { type: "application/json" }));
+    App.log("Резервная копия скачана");
+    localStorage.setItem("tanuki_lastBackup", Date.now().toString());
+  },
+  async backupImport(file) {
+    if (!file) return;
+    if (!confirm("Восстановить из копии? Текущие данные будут ЗАМЕНЕНЫ.")) return;
+    try {
+      const dump = JSON.parse(await file.text());
+      for (const name of Object.keys(DB_SCHEMA)) {
+        if (!Array.isArray(dump[name])) continue;
+        const os = IDB._db.transaction(name, "readwrite").objectStore(name);
+        await new Promise((res) => { const r = os.clear(); r.onsuccess = res; r.onerror = res; });
+        await IDB.bulkPut(name, dump[name]);
+      }
+      alert("Восстановлено. Приложение перезагрузится."); location.reload();
+    } catch (e) { alert("Не удалось прочитать файл копии."); }
+  },
+  // Auto daily internal snapshot timestamp (real file backup stays manual)
+  async autoBackupCheck() {
+    const last = Number(localStorage.getItem("tanuki_lastAutoBackup") || 0);
+    if (Date.now() - last < 24 * 3600 * 1000) return;
+    localStorage.setItem("tanuki_lastAutoBackup", Date.now().toString());
+    // push everything to Sheets queue is heavy; here we just log. Manual export = the real backup.
+    App.log("Авто-отметка резервного копирования (ежедневно)");
+  },
+
+  // Audit scheduling / coverage
+  async openSchedule() {
+    App._schedules = await DB.schedules();
+    const audits = (await DB.audits()).filter(a => a.status === AUDIT_STATUS.COMPLETED);
+    App._lastAudit = {};
+    audits.forEach(a => { if (!a.restaurantId) return; const t = new Date(a.startedAt).getTime(); if (!App._lastAudit[a.restaurantId] || t > App._lastAudit[a.restaurantId]) App._lastAudit[a.restaurantId] = t; });
+    App.route("schedule");
+  },
+  async schedSet(restaurantId, everyDays) {
+    everyDays = Math.max(0, Number(everyDays) || 0);
+    const ex = (App._schedules || []).find(s => s.restaurantId === restaurantId);
+    if (everyDays === 0) { if (ex) await DB.delSchedule(ex.id); }
+    else await DB.saveSchedule({ id: ex ? ex.id : "sch_" + restaurantId, restaurantId, everyDays });
+    App._schedules = await DB.schedules(); App.render();
+  },
+  schedOverdue(restaurantId) {
+    const s = (App._schedules || []).find(x => x.restaurantId === restaurantId); if (!s) return null;
+    const last = App._lastAudit[restaurantId];
+    const dueTs = (last || 0) + s.everyDays * 86400000;
+    return { everyDays: s.everyDays, last, overdue: Date.now() > dueTs, dueTs };
+  },
+
+  // Universal search
+  searchQuery: "",
+  openSearch() { App.searchQuery = ""; App.route("search"); },
+  async doSearch(q) {
+    q = (q || "").trim().toLowerCase();
+    const res = { audits: [], violations: [], users: [], places: [], depts: [] };
+    if (q.length < 2) { App._search = res; return; }
+    let audits = (await DB.audits());
+    audits = App.visibleAudits(audits);
+    const byId = {}; audits.forEach(a => byId[a.id] = a);
+    res.audits = audits.filter(a => (a.restaurant || "").toLowerCase().includes(q) || (a.auditorName || "").toLowerCase().includes(q)).slice(0, 20);
+    const cpMap = {}; (await IDB.getAll("checklist_structure")).forEach(c => cpMap[c.id] = c);
+    const idset = new Set(audits.map(a => a.id));
+    res.violations = (await IDB.getAll("audit_violations")).filter(v => idset.has(v.auditId) && ((v.comment || "").toLowerCase().includes(q) || App._objectOf(v, byId[v.auditId], cpMap).toLowerCase().includes(q)))
+      .slice(0, 20).map(v => ({ v, a: byId[v.auditId], object: App._objectOf(v, byId[v.auditId], cpMap) }));
+    if (App.isAdmin()) res.users = App.users.filter(u => (u.name || "").toLowerCase().includes(q) || (u.login || "").toLowerCase().includes(q) || (u.position || "").toLowerCase().includes(q)).slice(0, 20);
+    res.places = App._geo.filter(n => (n.name || "").toLowerCase().includes(q)).slice(0, 20);
+    res.depts = App._departments.filter(dp => (dp.name || "").toLowerCase().includes(q)).slice(0, 20);
+    App._search = res;
+  },
+
   shr: { auditId: null, granted: [] },
   openShare(auditId) {
     const granted = (App._access || []).filter(g => g.auditId === auditId).map(g => g.userId);
@@ -1836,7 +2197,7 @@ const App = {
     for (const g of existing) if (!grantedSet.has(g.userId)) await DB.delAccess(g.id);
     // add new
     const existSet = new Set(existing.map(g => g.userId));
-    for (const uid of granted) if (!existSet.has(uid)) await DB.saveAccess({ id: "acc_" + auditId + "_" + uid, auditId, userId: uid, grantedBy: App.user.id, ts: new Date().toISOString() });
+    for (const uid of granted) if (!existSet.has(uid)) { await DB.saveAccess({ id: "acc_" + auditId + "_" + uid, auditId, userId: uid, grantedBy: App.user.id, ts: new Date().toISOString() }); App.notify(uid, "Вам открыт доступ к отчёту", { type: "audit", auditId }); }
     App._access = await DB.access();
     App.route("audit_done");
   },
@@ -1848,13 +2209,14 @@ const App = {
     for (const v of vios) await IDB.del("audit_violations", v.id);
     await IDB.del("audits_history", id);
     await Sync.dequeue(id);
+    await App.log("Удалён аудит", id);
     await App.openHistory();
   },
 
   /* ---- admin: users & roles CRUD ---- */
   adm: { uDraft: null, rDraft: null },
   admUserNew() {
-    App.adm.uDraft = { id: "u_" + Date.now(), name: "", login: "", position: "", pin: "", roleIds: [], scope: [], photo: null, active: true };
+    App.adm.uDraft = { id: "u_" + Date.now(), name: "", login: "", position: "", pin: "", roleIds: [], scope: [], conceptIds: [], deptIds: [], photo: null, active: true };
     App.route("user_edit");
   },
   admUserEdit(id) {
@@ -1862,6 +2224,7 @@ const App = {
     App.adm.uDraft = JSON.parse(JSON.stringify(u));
     App.route("user_edit");
   },
+  ADMIN_PERMS: ["*", "users.manage", "roles.manage", "geo.manage", "org.manage", "checklist.edit", "audit.delete", "audit.viewAll"],
   async admUserSave() {
     const d = App.adm.uDraft;
     d.name = (d.name || "").trim(); d.login = (d.login || "").trim().toLowerCase(); d.position = (d.position || "").trim();
@@ -1869,10 +2232,39 @@ const App = {
     if (!/^\d{4,6}$/.test(d.pin || "")) { alert("PIN — от 4 до 6 цифр."); return; }
     if (App.users.some(u => u.id !== d.id && (u.login || "").toLowerCase() === d.login)) { alert("Такой логин уже занят."); return; }
     if (!(d.roleIds || []).length) { alert("Выберите хотя бы одну роль."); return; }
+    // Limited managers (createLogin but not full users.manage): rank + no-escalation guards
+    if (!App.can("users.manage")) {
+      if (Workflow.rankOf(d.positionId) <= Workflow.rankOf(App.user.positionId)) { alert("Можно заводить только сотрудников ниже вашей должности."); return; }
+      const eff = App.effectivePerms(d);
+      if (App.ADMIN_PERMS.some(p => eff.has(p))) { alert("Вы не можете выдавать административные права."); return; }
+    }
+    const backTo = App.adm._staffMode ? "staff" : "settings";
     await DB.saveUser(d);
     App.users = await DB.users();
     if (App.user && App.user.id === d.id) App.user = App.users.find(u => u.id === d.id);
-    App.route("settings");
+    App.adm._staffMode = false;
+    await App.log("Сохранён пользователь", d.name + " (@" + d.login + ")");
+    App.route(backTo);
+  },
+  /* ---- manager: staff (scoped, below-rank) ---- */
+  openStaff() {
+    if (!App.can("users.createLogin")) { App.route("home"); return; }
+    App.route("staff");
+  },
+  staffList() {
+    const myRank = Workflow.rankOf(App.user.positionId);
+    return App.users.filter(u => u.id !== App.user.id && Workflow.rankOf(u.positionId) > myRank);
+  },
+  admStaffNew() {
+    App.adm.uDraft = { id: "u_" + Date.now(), name: "", login: "", position: "", pin: "", roleIds: [], scope: (App.user.scope || []).slice(), conceptIds: (App.user.conceptIds || []).slice(), deptIds: (App.user.deptIds || []).slice(), photo: null, active: true };
+    App.adm._staffMode = true;
+    App.route("user_edit");
+  },
+  admStaffEdit(id) {
+    const u = App.users.find(x => x.id === id); if (!u) return;
+    App.adm.uDraft = JSON.parse(JSON.stringify(u));
+    App.adm._staffMode = true;
+    App.route("user_edit");
   },
   async admUserDel(id) {
     if (App.user && id === App.user.id) return;
@@ -1911,9 +2303,31 @@ const App = {
     try { App.adm.uDraft.photo = await Media.compress(files[0], 256, 0.75); App.render(); }
     catch (e) { alert("Не удалось загрузить фото."); }
   },
+  // Toggle an individual permission relative to the user's role baseline
+  toggleUserPerm(perm, want) {
+    const d = App.adm.uDraft;
+    d.permAdd = d.permAdd || []; d.permRemove = d.permRemove || [];
+    const roleHas = App.rolePerms(d).has("*") || App.rolePerms(d).has(perm);
+    d.permAdd = d.permAdd.filter(p => p !== perm);
+    d.permRemove = d.permRemove.filter(p => p !== perm);
+    if (want && !roleHas) d.permAdd.push(perm);      // grant beyond role
+    if (!want && roleHas) d.permRemove.push(perm);   // revoke from role
+    App.render();
+  },
+  // When a position is chosen, inherit its default role(s) + scope (user can then tweak)
+  applyPositionDefaults() {
+    const d = App.adm.uDraft;
+    const p = App._positions.find(x => x.id === d.positionId);
+    if (!p) return;
+    if ((p.roleIds || []).length) d.roleIds = p.roleIds.slice();
+    if ((p.scope || []).length) d.scope = p.scope.slice();
+    if ((p.conceptIds || []).length) d.conceptIds = p.conceptIds.slice();
+    if ((p.deptIds || []).length) d.deptIds = p.deptIds.slice();
+  },
 
   /* ---- admin: geo & positions CRUD ---- */
-  _geo: [], _positions: [], _orgRoles: [], _policies: [], _access: [], histFilterOpen: false,
+  _geo: [], _positions: [], _orgRoles: [], _policies: [], _access: [], _concepts: [], _departments: [], _catCount: {}, histFilterOpen: false, taskFilterOpen: false,
+  _notif: [], _notifUnread: 0, _search: null, _schedules: [], _lastAudit: {}, _journal: [],
   async geoAdd(parentId, type) {
     const name = (prompt("Название (" + Geo.TYPES[type] + "):") || "").trim();
     if (!name) return;
@@ -1926,11 +2340,21 @@ const App = {
     if (!confirm("Удалить элемент географии?")) return;
     await DB.delGeo(id); App._geo = await DB.geoNodes(); App.render();
   },
-  async posAdd(parentId) {
-    const title = (prompt("Название должности:") || "").trim();
-    if (!title) return;
-    await DB.savePosition({ id: "pos_" + Date.now(), title, parentId: parentId || null });
-    App._positions = await DB.positions(); App.render();
+  posNew(parentId) {
+    App.adm.posDraft = { id: "pos_" + Date.now(), title: "", parentId: parentId || null, roleIds: [], scope: [], conceptIds: [], deptIds: [] };
+    App.route("position_edit");
+  },
+  posEdit(id) {
+    const p = App._positions.find(x => x.id === id); if (!p) return;
+    App.adm.posDraft = JSON.parse(JSON.stringify(p));
+    App.route("position_edit");
+  },
+  async posSave() {
+    const d = App.adm.posDraft; d.title = (d.title || "").trim();
+    if (!d.title) { alert("Введите название должности."); return; }
+    await DB.savePosition(d);
+    App._positions = await DB.positions();
+    App.route("positions");
   },
   async posDel(id) {
     if (App._positions.some(p => p.parentId === id)) { alert("Сначала удалите подчинённые должности."); return; }
@@ -1938,6 +2362,105 @@ const App = {
     if (!confirm("Удалить должность?")) return;
     await DB.delPosition(id); App._positions = await DB.positions(); App.render();
   },
+
+  /* ---- admin: concepts (brands) ---- */
+  async conceptAdd() {
+    const name = (prompt("Название концепции (бренда):") || "").trim();
+    if (!name) return;
+    await DB.saveConcept({ id: "cpt_" + Date.now(), name, order: (App._concepts || []).length + 1 });
+    App._concepts = await DB.concepts(); App.render();
+  },
+  async conceptDel(id) {
+    if (App._geo.some(n => n.conceptId === id)) { alert("К концепции привязаны рестораны — сначала отвяжите."); return; }
+    if (App.users.some(u => (u.conceptIds || []).includes(id))) { alert("Концепция используется в доступах пользователей."); return; }
+    if (!confirm("Удалить концепцию?")) return;
+    await DB.delConcept(id); App._concepts = await DB.concepts(); App.render();
+  },
+  async setRestaurantConcept(restId, conceptId) {
+    const n = App._geo.find(x => x.id === restId); if (!n) return;
+    n.conceptId = conceptId || null; await DB.saveGeo(n);
+    App._geo = await DB.geoNodes();
+  },
+
+  /* ---- admin: departments ---- */
+  async deptAdd() {
+    const name = (prompt("Название подразделения:") || "").trim();
+    if (!name) return;
+    const deps = await DB.departments();
+    await DB.saveDept({ id: "dept_" + Date.now(), name, order: deps.length + 1 });
+    App.render();
+  },
+  async deptDel(id, hasContent) {
+    if (hasContent) { alert("У подразделения есть чек-лист. Сначала очистите его в конструкторе."); return; }
+    const audits = await DB.audits();
+    if (audits.some(a => (a.deptIds || []).includes(id))) { alert("По подразделению уже есть аудиты — удаление запрещено."); return; }
+    if (!confirm("Удалить подразделение?")) return;
+    await DB.delDept(id); App.render();
+  },
+
+  /* ---- constructor: checklist editor ---- */
+  ctr: { deptId: null, cats: [], checks: [], catDraft: null, cpDraft: null },
+  async openConstructor() {
+    if (!App.can("checklist.edit")) { App.route("home"); return; }
+    App._departments = await DB.departments();
+    const dep = (App.ctr.deptId && App._departments.some(d => d.id === App.ctr.deptId)) ? App.ctr.deptId : (App._departments[0] && App._departments[0].id);
+    if (dep) await App.ctrLoad(dep);
+    App.route("constructor");
+  },
+  async ctrLoad(deptId) {
+    App.ctr.deptId = deptId;
+    App.ctr.cats = (await DB.categories(deptId)).sort((a, b) => Number(a.code) - Number(b.code));
+    App.ctr.checks = (await DB.checkpoints(deptId)).sort((a, b) => {
+      const pa = String(a.index).split(".").map(Number), pb = String(b.index).split(".").map(Number);
+      return (pa[0] - pb[0]) || ((pa[1] || 0) - (pb[1] || 0));
+    });
+  },
+  async ctrLog(action) {
+    await DB.logVersion({ id: "ver_" + Date.now() + "_" + Math.random().toString(36).slice(2, 5), deptId: App.ctr.deptId, ts: new Date().toISOString(), author: App.user.name, action });
+  },
+  async ctrRefreshCounts() {
+    App._catCount = {}; (await IDB.getAll("checklist_categories")).forEach(c => App._catCount[c.deptId] = (App._catCount[c.deptId] || 0) + 1);
+  },
+  // categories
+  ctrCatNew() {
+    const nextCode = String((App.ctr.cats.reduce((m, c) => Math.max(m, Number(c.code) || 0), 0)) + 1);
+    App.ctr.catDraft = { id: "cat_" + Date.now(), deptId: App.ctr.deptId, code: nextCode, name: "", weight: 20 };
+    App.route("category_edit");
+  },
+  ctrCatEdit(id) { const c = App.ctr.cats.find(x => x.id === id); if (!c) return; App.ctr.catDraft = JSON.parse(JSON.stringify(c)); App.route("category_edit"); },
+  async ctrCatSave() {
+    const d = App.ctr.catDraft; d.name = (d.name || "").trim(); d.weight = Math.max(0, Number(d.weight) || 0);
+    if (!d.name) { alert("Введите название категории."); return; }
+    await DB.saveCategory(d); await App.ctrLog("Категория сохранена: " + d.name);
+    await App.ctrRefreshCounts(); await App.ctrLoad(App.ctr.deptId); App.route("constructor");
+  },
+  async ctrCatDel(id) {
+    const c = App.ctr.cats.find(x => x.id === id);
+    if ((App.ctr.checks || []).some(cp => cp.categoryId === id)) { alert("В категории есть пункты — сначала удалите их."); return; }
+    if (!confirm("Удалить категорию?")) return;
+    await DB.delCategory(id); await App.ctrLog("Категория удалена: " + (c ? c.name : id));
+    await App.ctrRefreshCounts(); await App.ctrLoad(App.ctr.deptId); App.render();
+  },
+  // checkpoints
+  ctrCpNew(categoryId) {
+    App.ctr.cpDraft = { id: "chk_" + Date.now(), deptId: App.ctr.deptId, categoryId, index: "", object: "", criterion: "", requirement: "", severityMode: SEVMODE.RANGE, fixedPenalty: 5 };
+    App.route("checkpoint_edit");
+  },
+  ctrCpEdit(id) { const c = App.ctr.checks.find(x => x.id === id); if (!c) return; App.ctr.cpDraft = JSON.parse(JSON.stringify(c)); App.route("checkpoint_edit"); },
+  async ctrCpSave() {
+    const d = App.ctr.cpDraft; d.object = (d.object || "").trim();
+    if (!d.object) { alert("Введите объект контроля."); return; }
+    if (d.severityMode === SEVMODE.FIXED) d.fixedPenalty = Math.max(0, Math.min(100, Number(d.fixedPenalty) || 0));
+    await DB.saveCheckpoint(d); await App.ctrLog("Пункт сохранён: " + d.object);
+    await App.ctrLoad(App.ctr.deptId); App.route("constructor");
+  },
+  async ctrCpDel(id) {
+    const c = App.ctr.checks.find(x => x.id === id);
+    if (!confirm("Удалить пункт?")) return;
+    await DB.delCheckpoint(id); await App.ctrLog("Пункт удалён: " + (c ? c.object : id));
+    await App.ctrLoad(App.ctr.deptId); App.render();
+  },
+  async openCtrHistory() { App.ctr._versions = (await DB.versions(App.ctr.deptId)).sort((a, b) => (a.ts < b.ts ? 1 : -1)); App.route("constructor_history"); },
 
   /* ---- admin: dispute policies ---- */
   admPolicyEdit(id) {
@@ -1973,13 +2496,22 @@ const App = {
   fmtDate(iso) { const d = new Date(iso); return d.toLocaleDateString("ru-RU") + " " + d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }); },
 
   _roles: [],
-  myPerms() {
-    if (!App.user) return new Set();
+  // Permissions from a user's ROLES only (baseline, before individual overrides)
+  rolePerms(u) {
     const set = new Set();
-    (App._roles || []).filter(r => (App.user.roleIds || []).includes(r.id))
+    (App._roles || []).filter(r => (u.roleIds || []).includes(r.id))
       .forEach(r => (r.permissions || []).forEach(p => set.add(p)));
     return set;
   },
+  // Effective permissions = roles + individual permAdd − permRemove ("*" expands if removals exist)
+  effectivePerms(u) {
+    const set = App.rolePerms(u);
+    (u.permAdd || []).forEach(p => set.add(p));
+    if (set.has("*") && (u.permRemove || []).length) { set.delete("*"); ALL_PERMISSIONS.forEach(p => set.add(p)); }
+    (u.permRemove || []).forEach(p => set.delete(p));
+    return set;
+  },
+  myPerms() { return App.user ? App.effectivePerms(App.user) : new Set(); },
   can(perm) { const s = App.myPerms(); return s.has("*") || s.has(perm); },
   isAdmin() { return App.can("users.manage") || App.can("roles.manage"); },
   userRoleNames(u) {
@@ -2020,6 +2552,7 @@ const App = {
         ${left}
         <h1 class="font-semibold text-[15px] flex-1 truncate ${opts.back ? "" : "sr-only"}">${title}</h1>
         ${App._badge()}
+        ${App.user ? `<button data-action="open-notifications" aria-label="Уведомления" class="tnk-press relative w-10 h-10 grid place-items-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">${UI.icon("bell", "w-5 h-5")}${App._notifUnread ? `<span class="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 grid place-items-center rounded-full bg-brand text-white text-[10px] font-bold">${App._notifUnread > 9 ? "9+" : App._notifUnread}</span>` : ""}</button>` : ""}
         <button data-action="theme" aria-label="Сменить тему" class="tnk-press w-10 h-10 grid place-items-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">${UI.icon(Session.data.theme === "dark" ? "sun" : "moon", "w-5 h-5")}</button>
       </div></header>`;
   },
@@ -2064,10 +2597,14 @@ const App = {
           <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Действия</h2>
           <div class="grid grid-cols-2 gap-3">
             ${App.can("analytics.view") ? App.tile("dashboard", "gauge", "Дашборд", "Статистика и задачи", true) : ""}
+            ${(App.can("task.resolve") || App.can("task.assign") || App.can("analytics.view")) ? App.tile("tasks", "inbox", "Задачи", "Что и где устранить", true) : ""}
+            ${App.tile("search", "search", "Поиск", "По всем разделам", true)}
+            ${(App.isAdmin() || App.can("audit.viewScope")) ? App.tile("schedule", "calendar", "План проверок", "Охват и просрочки", true) : ""}
             ${App.can("audit.conduct") ? App.tile("new-audit", "clipboard", "Новый аудит", "По подразделению или всем", true) : ""}
             ${App.tile("history", "chart", "История", "Проверки и тренды", true)}
-            ${App.can("checklist.edit") ? App.tile("constructor", "sliders", "Конструктор", "Чек-листы, веса, штрафы") : ""}
+            ${App.can("checklist.edit") ? App.tile("open-constructor", "sliders", "Конструктор", "Чек-листы, веса, штрафы", true) : ""}
             ${App.isAdmin() ? App.tile("settings", "users", "Настройки", "Пользователи, роли, доступы") : ""}
+            ${(!App.isAdmin() && App.can("users.createLogin")) ? App.tile("staff", "users", "Сотрудники", "Мои сотрудники и PIN", true) : ""}
           </div>
         </section></main>`;
     },
@@ -2183,8 +2720,12 @@ const App = {
           ${cp.requirement ? `<p class="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">${cp.requirement}</p>` : ""}
         </div>
         <div><label class="block text-sm font-medium mb-2">Тип нарушения</label><div class="flex gap-2">${sevBtn(SEVERITY.CRITICAL, "Критично")}${sevBtn(SEVERITY.NON_CRITICAL, "Некритично")}</div></div>
-        <div><label class="block text-sm font-medium mb-2" for="pen">Штраф</label>
-          <select id="pen" data-field="penalty" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">${penaltyOpts}</select></div>
+        ${d.severityMode === SEVMODE.FIXED
+          ? `<div><label class="block text-sm font-medium mb-2">Штраф</label><div class="h-12 px-3 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm flex items-center text-slate-600 dark:text-slate-300">−${d.penaltyPercent}% · фиксированный${d.penaltyPercent >= 100 ? " (обнуляет категорию)" : ""}</div></div>`
+          : d.severityMode === SEVMODE.MANAGER
+          ? `<div class="p-3 rounded-xl bg-violet-50 dark:bg-violet-500/5 border border-violet-200 dark:border-violet-500/20 text-sm text-slate-600 dark:text-slate-300">${UI.icon("shield", "w-4 h-4 inline mr-1 -mt-0.5")}Оценку в процентах поставит руководитель. Вы фиксируете факт нарушения.</div>`
+          : `<div><label class="block text-sm font-medium mb-2" for="pen">Штраф</label>
+              <select id="pen" data-field="penalty" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">${penaltyOpts}</select></div>`}
         <div><label class="block text-sm font-medium mb-2" for="vComment">Комментарий</label>
           <div class="relative"><textarea id="vComment" data-field="comment" rows="3" class="w-full p-3 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm resize-none" placeholder="Опишите нарушение…">${d.comment}</textarea>
             <button data-action="vform-voice" aria-label="Голосовой ввод" class="absolute top-2 right-2 w-9 h-9 grid place-items-center rounded-lg ${Voice.active ? "bg-brand text-white animate-pulse" : "bg-slate-100 dark:bg-slate-800 text-slate-500"}">${UI.icon("mic", "w-5 h-5")}</button></div>
@@ -2195,6 +2736,9 @@ const App = {
           <input id="photoInput" type="file" accept="image/*" capture="environment" multiple class="hidden"></div>
         <div><label class="block text-sm font-medium mb-2" for="asg">Ответственный (Fix by…)</label>
           <select id="asg" data-field="assignee" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">${roleOpts}</select></div>
+        <div><label class="block text-sm font-medium mb-2" for="vdl">Срок устранения</label>
+          <input id="vdl" type="date" data-field="vdeadline" value="${d.deadline || ""}" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">
+          <div class="text-xs text-slate-400 mt-1">Пусто = бессрочно (задача остаётся на контроле).</div></div>
         <div class="text-xs text-slate-400">Время фиксации: ${App.fmtTime(d.createdAt)}</div>
         ${existingList}
       </main>
@@ -2247,11 +2791,29 @@ const App = {
         </div>
         <div class="space-y-2">${perDept}</div>
         ${vioList}
+        ${(function () {
+          const ack = a.acknowledgment;
+          const pickList = (App.staffList ? App.staffList() : App.users.filter(u => u.active && u.id !== App.user.id));
+          const users = pickList.length ? pickList : App.users.filter(u => u.active && u.id !== App.user.id);
+          const sel = (act) => `<select data-field="ack-user" class="w-full h-11 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm mb-2"><option value="">— выберите сотрудника —</option>${users.map(u => `<option value="${u.id}" ${App.ackPick === u.id ? "selected" : ""}>${Reports._esc(u.name)}${u.position ? " · " + Reports._esc(u.position) : ""}</option>`).join("")}</select>
+            <button data-action="${act}" class="tnk-press w-full h-11 rounded-xl bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 font-medium text-sm">${act === "ack-request" ? "Отправить на ознакомление" : "Передать другому"}</button>`;
+          const canRequest = a.auditorId === App.user.id || App.can("task.assign");
+          let inner = "";
+          if (!ack) inner = canRequest ? `<div class="text-xs text-slate-500 mb-2">Отправьте отчёт ответственному лицу для ознакомления.</div>${sel("ack-request")}` : `<div class="text-sm text-slate-500">Ознакомление не запрошено.</div>`;
+          else if (ack.status === "done") inner = `<div class="text-sm text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1.5">${UI.icon("check", "w-4 h-4")}Ознакомлен: ${Reports._esc(ack.confirmedByName)} · ${App.fmtDate(ack.confirmedTs)}</div>`;
+          else if (ack.assignedToId === App.user.id) inner = `<div class="text-sm mb-2">Отчёт направлен вам на ознакомление.</div>
+            <button data-action="ack-confirm" class="tnk-press w-full h-11 rounded-xl bg-emerald-600 text-white font-semibold text-sm mb-3">Подтвердить ознакомление</button>
+            <div class="text-xs text-slate-500 mb-1">Или передать подчинённому:</div>${sel("ack-delegate")}`;
+          else inner = `<div class="text-sm text-amber-600 dark:text-amber-400">Ожидает ознакомления: ${Reports._esc(ack.assignedToName || "")}</div>`;
+          return `<div><div class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Ознакомление</div>
+            <div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">${inner}</div></div>`;
+        })()}
         <div>
           <div class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Экспорт отчёта</div>
-          <div class="grid grid-cols-3 gap-2">
+          <div class="grid grid-cols-4 gap-2">
             <button data-action="export-pdf" class="tnk-press flex flex-col items-center gap-1.5 py-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">${UI.icon("file", "w-5 h-5 text-brand")}<span class="text-xs font-medium">PDF</span></button>
             <button data-action="export-excel" class="tnk-press flex flex-col items-center gap-1.5 py-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">${UI.icon("file", "w-5 h-5 text-emerald-600")}<span class="text-xs font-medium">Excel</span></button>
+            <button data-action="export-csv" class="tnk-press flex flex-col items-center gap-1.5 py-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">${UI.icon("file", "w-5 h-5 text-amber-600")}<span class="text-xs font-medium">CSV</span></button>
             <button data-action="export-html" class="tnk-press flex flex-col items-center gap-1.5 py-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">${UI.icon("download", "w-5 h-5 text-slate-500")}<span class="text-xs font-medium">HTML</span></button>
           </div>
         </div>
@@ -2303,6 +2865,95 @@ const App = {
         </div>
         ${queue}${attention}${recent}
         ${App.can("audit.conduct") ? `<button data-action="new-audit" class="tnk-press w-full h-13 py-4 rounded-2xl bg-brand text-white font-semibold inline-flex items-center justify-center gap-2">${UI.icon("clipboard", "w-5 h-5")}Провести проверку</button>` : ""}
+      </main>`;
+    },
+
+    tasks() {
+      const f = App.taskFilter, nf = App.taskActiveFilters();
+      const all = App.taskRaw, list = App.filteredTasks();
+      const overdueCount = all.filter(t => App._isOverdue(t.v)).length;
+      const rests = [...new Map(all.filter(t => t.a.restaurantId).map(t => [t.a.restaurantId, t.a.restaurant])).entries()].map(([id, name]) => ({ id, name }));
+      const depts = [...new Set(all.map(t => t.v.deptId))].map(id => ({ id, name: App.deptName(id) }));
+      const sel = (field, cur, ph, items) => `<select data-field="${field}" class="w-full h-11 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"><option value="">${ph}</option>${items.map(it => `<option value="${it.id}" ${cur === it.id ? "selected" : ""}>${Reports._esc(it.name)}</option>`).join("")}</select>`;
+      const statusName = { open: "Открыто", fix_submitted: "На проверке", dispute_rejected: "Оспаривание отклонено" };
+      const panel = App.taskFilterOpen ? `<div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-3">
+        ${rests.length ? sel("tf-restaurant", f.restaurant, "Ресторан — любой", rests) : ""}
+        ${sel("tf-dept", f.dept, "Подразделение — любое", depts)}
+        ${sel("tf-assignee", f.assignee, "Ответственный — любой", App._orgRoles.map(r => ({ id: r.id, name: r.title })))}
+        ${sel("tf-status", f.status, "Статус — любой", Object.entries(statusName).map(([id, name]) => ({ id, name })))}
+        <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" data-field="tf-overdue" ${f.overdue ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]"><span class="text-sm">Только просроченные</span></label>
+        <button data-action="tasks-reset" class="tnk-press w-full h-10 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300">Сбросить фильтры</button>
+      </div>` : "";
+      const rows = list.map((t) => { const over = App._isOverdue(t.v); const st = t.v.status || "open";
+        const assignee = (App._orgRoles.find(r => r.id === t.v.assigneeRole) || {}).title;
+        return `<button data-action="task-open" data-audit="${t.a.id}" data-vio="${t.v.id}" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border ${over ? "border-brand/40" : "border-slate-200 dark:border-slate-800"} text-left">
+          <span class="w-2 h-2 shrink-0 rounded-full ${t.v.severity === SEVERITY.CRITICAL ? "bg-brand" : "bg-slate-400"}"></span>
+          <div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${Reports._esc(t.object)}${t.repeat > 1 ? ` <span class="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">повтор ×${t.repeat}</span>` : ""}</div>
+            <div class="text-xs text-slate-500 truncate">${t.a.restaurant ? Reports._esc(t.a.restaurant) + " · " : ""}${App.deptName(t.v.deptId)}${assignee ? " · " + Reports._esc(assignee) : ""}</div>
+            <div class="text-[11px] mt-0.5">${statusName[st] || st}${t.v.deadline ? ` · <span class="${over ? "text-brand font-medium" : "text-slate-400"}">до ${new Date(t.v.deadline).toLocaleDateString("ru-RU")}${over ? " (просрочено)" : ""}</span>` : ' · <span class="text-slate-400">бессрочно</span>'}</div></div>
+          ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`; }).join("");
+      return App.appBar("Задачи", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-4">
+        <div class="flex items-center gap-2">
+          <button data-action="tasks-filter-toggle" class="tnk-press inline-flex items-center gap-1.5 h-9 px-3 rounded-xl border ${nf ? "border-brand text-brand bg-brand/5" : "border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300"} text-sm font-medium">${UI.icon("filter", "w-4 h-4")}Фильтры${nf ? " · " + nf : ""}</button>
+          ${overdueCount ? `<span class="text-sm text-brand font-medium">${overdueCount} просрочено</span>` : ""}
+          <button data-action="export-tasks-csv" class="tnk-press ml-auto inline-flex items-center gap-1 text-[13px] text-brand font-medium">${UI.icon("download", "w-4 h-4")}CSV</button>
+        </div>
+        ${panel}
+        <div><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Открытые задачи (${list.length})</h2>
+        <div class="space-y-2">${list.length ? rows : '<div class="text-center text-sm text-slate-500 py-8">Нет открытых задач.</div>'}</div></div>
+      </main>`;
+    },
+
+    notifications() {
+      const list = App._notif || [];
+      return App.appBar("Уведомления", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-2">
+        ${list.some(n => !n.read) ? `<button data-action="notif-read-all" class="tnk-press text-[13px] text-brand font-medium mb-1">Отметить все прочитанными</button>` : ""}
+        ${list.length ? list.map(n => `<button data-action="notif-open" data-id="${n.id}" class="tnk-press w-full flex items-start gap-3 p-3.5 rounded-2xl border text-left ${n.read ? "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800" : "bg-brand/5 border-brand/20"}">
+          <span class="w-2 h-2 mt-1.5 shrink-0 rounded-full ${n.read ? "bg-transparent" : "bg-brand"}"></span>
+          <div class="flex-1 min-w-0"><div class="text-sm">${Reports._esc(n.text)}</div><div class="text-xs text-slate-500 mt-0.5">${App.fmtDate(n.ts)}</div></div>
+          ${n.link ? UI.icon("chevron", "w-4 h-4 text-slate-400 mt-1") : ""}</button>`).join("") : '<div class="text-center text-sm text-slate-500 py-10">Уведомлений нет.</div>'}
+      </main>`;
+    },
+
+    search() {
+      const r = App._search || { audits: [], violations: [], users: [], places: [], depts: [] };
+      const q = App.searchQuery || "";
+      const sec = (title, items, render) => items && items.length ? `<section><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">${title} (${items.length})</h2><div class="space-y-2">${items.map(render).join("")}</div></section>` : "";
+      const has = (r.audits.length + r.violations.length + r.users.length + r.places.length + r.depts.length) > 0;
+      return App.appBar("Поиск", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-4">
+        <input id="searchInput" data-field="search-q" value="${Reports._esc(q)}" placeholder="Ресторан, аудитор, нарушение, сотрудник, город…" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">
+        ${q.length < 2 ? '<div class="text-center text-sm text-slate-500 py-8">Введите минимум 2 символа.</div>' : has ? `
+          ${sec("Аудиты", r.audits, a => `<button data-action="open-history-item" data-id="${a.id}" class="tnk-press w-full flex items-center gap-2 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left"><div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${a.restaurant ? Reports._esc(a.restaurant) : "—"} · ${a.scope === "all" ? "Все" : App.deptName(a.deptIds[0])}</div><div class="text-xs text-slate-500">${Reports._esc(a.auditorName || "")} · ${App.fmtDate(a.startedAt)}</div></div><span class="font-semibold ${App.scoreColor(a.finalScore == null ? 100 : a.finalScore)}">${a.status === AUDIT_STATUS.COMPLETED ? Math.round(a.finalScore == null ? 100 : a.finalScore) + "%" : "—"}</span></button>`)}
+          ${sec("Нарушения", r.violations, x => `<button data-action="task-open" data-audit="${x.a.id}" data-vio="${x.v.id}" class="tnk-press w-full flex items-center gap-2 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left"><div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${Reports._esc(x.object)}</div><div class="text-xs text-slate-500 truncate">${x.a && x.a.restaurant ? Reports._esc(x.a.restaurant) + " · " : ""}${x.v.comment ? Reports._esc(x.v.comment) : ""}</div></div>${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`)}
+          ${sec("Сотрудники", r.users, u => `<button data-action="adm-user-edit" data-id="${u.id}" class="tnk-press w-full flex items-center gap-2 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left"><div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${Reports._esc(u.name)}</div><div class="text-xs text-slate-500 truncate">@${Reports._esc(u.login || "")} · ${Reports._esc(u.position || "")}</div></div>${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`)}
+          ${sec("Локации", r.places, n => `<div class="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"><span class="text-[11px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">${Geo.TYPES[n.type]}</span> ${Reports._esc(n.name)}</div>`)}
+          ${sec("Подразделения", r.depts, dp => `<div class="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">${Reports._esc(dp.name)}</div>`)}
+        ` : '<div class="text-center text-sm text-slate-500 py-8">Ничего не найдено.</div>'}
+      </main>`;
+    },
+
+    schedule() {
+      if (!App.isAdmin() && !App.can("audit.viewScope")) return App.screens.home();
+      const rests = App._geo.filter(n => n.type === "restaurant");
+      const rows = rests.map(rst => { const s = App.schedOverdue(rst.id); const last = App._lastAudit[rst.id];
+        return `<div class="flex items-center gap-2 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border ${s && s.overdue ? "border-brand/40" : "border-slate-200 dark:border-slate-800"}">
+          <div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${Reports._esc(rst.name)}</div>
+            <div class="text-xs text-slate-500">${last ? "последний: " + new Date(last).toLocaleDateString("ru-RU") : "ещё не проверялся"}${s && s.overdue ? ' · <span class="text-brand font-medium">просрочено</span>' : (s ? ' · след. до ' + new Date(s.dueTs).toLocaleDateString("ru-RU") : "")}</div></div>
+          <label class="text-xs text-slate-500 shrink-0">раз в <input type="number" min="0" data-field="sched-days" data-id="${rst.id}" value="${(App._schedules.find(x => x.restaurantId === rst.id) || {}).everyDays || ""}" placeholder="—" class="w-14 h-8 mx-1 px-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm text-center"> дн.</label>
+        </div>`; }).join("");
+      return App.appBar("План проверок", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-3">
+        <p class="text-[13px] text-slate-500 dark:text-slate-400">Задайте периодичность (в днях) для каждого ресторана. Просроченные подсвечиваются. Пусто = без плана.</p>
+        ${rows || '<div class="text-center text-sm text-slate-500 py-8">Нет ресторанов. Добавьте в Настройки → География.</div>'}
+      </main>`;
+    },
+
+    journal() {
+      if (!App.isAdmin()) return App.screens.home();
+      const list = (App._journal || []).slice(0, 200);
+      return App.appBar("Журнал действий", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-2">
+        ${list.length ? list.map(l => `<div class="p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div class="text-sm">${Reports._esc(l.action)}${l.detail ? ' <span class="text-slate-500">— ' + Reports._esc(l.detail) + "</span>" : ""}</div>
+          <div class="text-xs text-slate-500 mt-0.5">${Reports._esc(l.actor)} · ${App.fmtDate(l.ts)}</div></div>`).join("") : '<div class="text-center text-sm text-slate-500 py-8">Записей нет.</div>'}
       </main>`;
     },
 
@@ -2364,9 +3015,10 @@ const App = {
           <div class="text-sm text-slate-500">${cp.index || ""} · ${Reports._esc(cp.criterion || "")}</div>
           <span class="text-xs px-2.5 py-1 rounded-full ${m.cls}">${m.label}</span></div>
         <div class="text-lg font-semibold">${Reports._esc(cp.object || "")}</div>
-        <div class="text-xs text-slate-500">−${v.penaltyPercent}%${assignee ? " · ответственный: " + Reports._esc(assignee) : ""}${v.status === VIO_STATUS.DISPUTE_UPHELD ? " · балл восстановлен" : ""}</div>
+        <div class="text-xs text-slate-500">${v.pendingScore ? '<span class="text-violet-600 dark:text-violet-400 font-medium">оценка не выставлена</span>' : "−" + v.penaltyPercent + "%"}${assignee ? " · ответственный: " + Reports._esc(assignee) : ""}${v.status === VIO_STATUS.DISPUTE_UPHELD ? " · балл восстановлен" : ""}</div>
         ${findingBlock}
         ${thread}
+        ${App.can("score.override") ? `<button data-action="wf-set-score" class="tnk-press w-full h-11 rounded-xl border ${v.pendingScore ? "border-violet-400 text-violet-600 dark:text-violet-400" : "border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300"} font-medium text-sm">${v.pendingScore ? "Поставить оценку (%)" : "Изменить оценку (сейчас −" + v.penaltyPercent + "%)"}</button>` : ""}
         ${disputeInfo}${resolveBar}${gateNote}${approveBar}${composer}
       </main>`;
     },
@@ -2442,7 +3094,99 @@ const App = {
         <div><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Аудиты (${h.audits.length})</h2>
         <div class="space-y-2">${list}</div></div></main>`;
     },
-    constructor() { return App.can("checklist.edit") ? App.stub("Конструктор", "Категории/пункты/веса/штрафы — Шаг 4") : App.screens.home(); },
+    constructor() {
+      if (!App.can("checklist.edit")) return App.screens.home();
+      const c = App.ctr;
+      const deptChips = App._departments.map(dep => `<button data-action="ctr-dept" data-id="${dep.id}" class="tnk-press shrink-0 px-3 h-9 rounded-full text-sm font-medium border ${dep.id === c.deptId ? "bg-brand text-white border-brand" : "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300"}">${Reports._esc(dep.name)}</button>`).join("");
+      const totalW = c.cats.reduce((s, x) => s + (Number(x.weight) || 0), 0);
+      const sevBadge = (cp) => { const m = cp.severityMode || SEVMODE.RANGE;
+        const cls = m === SEVMODE.FIXED ? "bg-brand/10 text-brand" : m === SEVMODE.MANAGER ? "bg-violet-100 text-violet-700 dark:bg-violet-500/10 dark:text-violet-400" : "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400";
+        const txt = m === SEVMODE.FIXED ? "фикс. " + (cp.fixedPenalty || 0) + "%" : m === SEVMODE.MANAGER ? "оценка руков." : "аудитор";
+        return `<span class="text-[10px] px-1.5 py-0.5 rounded-full ${cls}">${txt}</span>`; };
+      const catBlocks = c.cats.map(cat => {
+        const cps = c.checks.filter(x => x.categoryId === cat.id);
+        return `<div class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
+          <div class="flex items-center gap-2 p-3.5 border-b border-slate-100 dark:border-slate-800">
+            <button data-action="ctr-cat-edit" data-id="${cat.id}" class="tnk-press flex-1 min-w-0 text-left"><div class="font-semibold text-sm truncate">${Reports._esc(cat.name)}</div><div class="text-xs text-slate-500">вес ${cat.weight}% · ${cps.length} пунктов</div></button>
+            <button data-action="ctr-cp-new" data-cat="${cat.id}" class="tnk-press shrink-0 text-[11px] font-semibold text-brand px-2 h-7 rounded-lg bg-brand/5">+ пункт</button>
+            <button data-action="ctr-cat-del" data-id="${cat.id}" aria-label="Удалить" class="tnk-press shrink-0 w-7 h-7 grid place-items-center rounded-lg text-slate-400">${UI.icon("trash", "w-4 h-4")}</button>
+          </div>
+          ${cps.map(cp => `<div class="flex items-center gap-2 px-3.5 py-2.5 border-b border-slate-50 dark:border-slate-800/50">
+            <button data-action="ctr-cp-edit" data-id="${cp.id}" class="tnk-press flex-1 min-w-0 text-left">
+              <div class="text-[13px] text-slate-400">${cp.index || "—"} · ${Reports._esc(cp.criterion || "")}</div>
+              <div class="text-sm truncate">${Reports._esc(cp.object || "")}</div></button>
+            ${sevBadge(cp)}
+            <button data-action="ctr-cp-del" data-id="${cp.id}" aria-label="Удалить" class="tnk-press shrink-0 w-7 h-7 grid place-items-center rounded-lg text-slate-400">${UI.icon("trash", "w-4 h-4")}</button>
+          </div>`).join("")}
+        </div>`; }).join("");
+      return App.appBar("Конструктор", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-4">
+        ${App._departments.length ? `<div class="flex gap-2 overflow-x-auto pb-1 -mx-4 px-4">${deptChips}</div>` : ""}
+        ${c.deptId ? `
+          <div class="flex items-center justify-between">
+            <div class="text-xs ${totalW === 100 ? "text-slate-500" : "text-amber-600 dark:text-amber-400"}">Сумма весов: ${totalW}%${totalW === 100 ? "" : " (обычно 100%)"}</div>
+            <div class="flex gap-2">
+              <button data-action="ctr-history" class="tnk-press text-[13px] text-slate-500 inline-flex items-center gap-1">${UI.icon("file", "w-4 h-4")}Версии</button>
+              <button data-action="ctr-export" class="tnk-press text-[13px] text-brand font-medium inline-flex items-center gap-1">${UI.icon("download", "w-4 h-4")}Экспорт</button>
+            </div>
+          </div>
+          ${catBlocks || '<div class="text-center text-sm text-slate-500 py-8">В подразделении пока нет категорий.</div>'}
+          <button data-action="ctr-cat-new" class="tnk-press w-full h-12 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-500">+ Добавить категорию</button>
+        ` : '<div class="text-center text-sm text-slate-500 py-8">Нет подразделений. Добавьте их в Настройки → Подразделения.</div>'}
+      </main>`;
+    },
+
+    category_edit() {
+      const d = App.ctr.catDraft; if (!d || !App.can("checklist.edit")) return App.screens.constructor();
+      const isNew = !App.ctr.cats.some(x => x.id === d.id);
+      return App.appBar(isNew ? "Новая категория" : "Категория", { back: "constructor" }) + `<main class="max-w-3xl mx-auto px-4 py-6 pb-28 space-y-5">
+        <div><label class="block text-sm font-medium mb-2">Название</label>
+          <input data-field="cat-name" value="${Reports._esc(d.name || "")}" placeholder="напр. Оборудование" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"></div>
+        <div><label class="block text-sm font-medium mb-2">Вес категории: ${d.weight}%</label>
+          <input type="range" min="0" max="100" step="5" data-field="cat-weight" value="${d.weight}" class="w-full accent-[#EA1B24]">
+          <div class="text-xs text-slate-500 mt-1">Итоговая оценка — взвешенное среднее по категориям.</div></div>
+      </main>
+      <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
+        <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
+          <button data-route="constructor" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отмена</button>
+          <button data-action="ctr-cat-save" class="tnk-press flex-[1.3] h-12 rounded-xl bg-brand text-white font-semibold text-sm">Сохранить</button>
+        </div></footer>`;
+    },
+
+    checkpoint_edit() {
+      const d = App.ctr.cpDraft; if (!d || !App.can("checklist.edit")) return App.screens.constructor();
+      const isNew = !App.ctr.checks.some(x => x.id === d.id);
+      const input = (field, label, val, ph) => `<div><label class="block text-sm font-medium mb-2">${label}</label>
+        <input data-field="${field}" value="${Reports._esc(val || "")}" placeholder="${ph || ""}" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"></div>`;
+      const modeBtn = (m) => `<button data-action="cp-mode" data-val="${m}" class="tnk-press flex-1 h-11 rounded-xl text-xs font-medium border ${d.severityMode === m ? "bg-brand text-white border-brand" : "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300"}">${SEVMODE_LABEL[m]}</button>`;
+      return App.appBar(isNew ? "Новый пункт" : "Пункт", { back: "constructor" }) + `<main class="max-w-3xl mx-auto px-4 py-6 pb-28 space-y-5">
+        ${input("cp-index", "Индекс", d.index, "напр. 1.1")}
+        ${input("cp-object", "Объект контроля", d.object, "напр. Холодильное оборудование")}
+        ${input("cp-criterion", "Критерий", d.criterion, "напр. Чистота")}
+        <div><label class="block text-sm font-medium mb-2">Требование стандарта</label>
+          <textarea data-field="cp-req" rows="4" class="w-full p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm resize-none" placeholder="Что проверяем и как выглядит норма…">${Reports._esc(d.requirement || "")}</textarea></div>
+        <div><label class="block text-sm font-medium mb-2">Режим оценки критичности</label>
+          <div class="flex gap-2">${modeBtn(SEVMODE.RANGE)}${modeBtn(SEVMODE.FIXED)}${modeBtn(SEVMODE.MANAGER)}</div>
+          <div class="text-xs text-slate-500 mt-2">${d.severityMode === SEVMODE.FIXED ? "Штраф зашит, аудитор не меняет." : d.severityMode === SEVMODE.MANAGER ? "Аудитор фиксирует факт; процент ставит руководитель (право «ручная оценка»)." : "Аудитор выбирает штраф из справочника."}</div>
+          ${d.severityMode === SEVMODE.FIXED ? `<div class="mt-3"><label class="block text-sm font-medium mb-2">Фиксированный штраф: ${d.fixedPenalty || 0}% ${(d.fixedPenalty || 0) >= 100 ? "(обнуляет категорию)" : ""}</label><input type="range" min="0" max="100" step="5" data-field="cp-fixed" value="${d.fixedPenalty || 0}" class="w-full accent-[#EA1B24]"></div>` : ""}
+        </div>
+      </main>
+      <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
+        <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
+          <button data-route="constructor" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отмена</button>
+          <button data-action="ctr-cp-save" class="tnk-press flex-[1.3] h-12 rounded-xl bg-brand text-white font-semibold text-sm">Сохранить</button>
+        </div></footer>`;
+    },
+
+    constructor_history() {
+      if (!App.can("checklist.edit")) return App.screens.home();
+      const list = App.ctr._versions || [];
+      const dep = (App._departments.find(x => x.id === App.ctr.deptId) || {}).name || "";
+      return App.appBar("Версии: " + dep, { back: "constructor" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-2">
+        ${list.length ? list.map(v => `<div class="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div class="text-sm">${Reports._esc(v.action)}</div>
+          <div class="text-xs text-slate-500 mt-0.5">${Reports._esc(v.author)} · ${App.fmtDate(v.ts)}</div></div>`).join("") : '<div class="text-center text-sm text-slate-500 py-8">Изменений пока нет.</div>'}
+      </main>`;
+    },
 
     settings() {
       if (!App.isAdmin()) return App.screens.home();
@@ -2467,13 +3211,18 @@ const App = {
           ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`;
       };
       return App.appBar("Настройки", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-6">
-        <section>
-          <div class="flex items-center justify-between mb-3">
-            <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Пользователи (${App.users.length})</h2>
-            <button data-action="adm-user-new" class="tnk-press inline-flex items-center gap-1 text-[13px] font-semibold text-brand">${UI.icon("plus", "w-4 h-4")}Добавить</button>
-          </div>
-          <div class="space-y-2">${App.users.map(userRow).join("")}</div>
-        </section>
+        ${(function () {
+          const q = (App.adm.userQuery || "").trim().toLowerCase();
+          const list = q ? App.users.filter(u => (u.name || "").toLowerCase().includes(q) || (u.login || "").toLowerCase().includes(q) || (u.position || "").toLowerCase().includes(q) || App.userRoleNames(u).toLowerCase().includes(q)) : App.users;
+          return `<section>
+            <div class="flex items-center justify-between mb-3">
+              <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Пользователи (${list.length}${q ? "/" + App.users.length : ""})</h2>
+              <button data-action="adm-user-new" class="tnk-press inline-flex items-center gap-1 text-[13px] font-semibold text-brand">${UI.icon("plus", "w-4 h-4")}Добавить</button>
+            </div>
+            <input id="userSearch" data-field="user-search" value="${Reports._esc(App.adm.userQuery || "")}" placeholder="Поиск: имя, логин, должность, роль…" class="w-full h-11 px-3 mb-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">
+            <div class="space-y-2">${list.length ? list.map(userRow).join("") : '<div class="text-sm text-slate-500 text-center py-4">Никого не найдено.</div>'}</div>
+          </section>`;
+        })()}
         <section>
           <div class="flex items-center justify-between mb-3">
             <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Роли (${App._roles.length})</h2>
@@ -2484,9 +3233,17 @@ const App = {
         <section>
           <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Структура компании</h2>
           <div class="space-y-2">
+            <button data-route="concepts" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+              <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("layers", "w-5 h-5")}</div>
+              <div class="flex-1"><div class="font-medium text-sm">Концепции (бренды)</div><div class="text-xs text-slate-500">${App._concepts.length ? App._concepts.map(c => c.name).join(", ") : "не заданы"}</div></div>
+              ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>
             <button data-route="geo" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
               <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("store", "w-5 h-5")}</div>
               <div class="flex-1"><div class="font-medium text-sm">География</div><div class="text-xs text-slate-500">Страна → город → ресторан (${App._geo.length})</div></div>
+              ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>
+            <button data-route="departments_manage" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+              <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("sliders", "w-5 h-5")}</div>
+              <div class="flex-1"><div class="font-medium text-sm">Подразделения</div><div class="text-xs text-slate-500">${App._departments.length} шт. · чек-листы в конструкторе</div></div>
               ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>
             <button data-route="positions" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
               <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("users", "w-5 h-5")}</div>
@@ -2496,6 +3253,20 @@ const App = {
               <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("shield", "w-5 h-5")}</div>
               <div class="flex-1"><div class="font-medium text-sm">Согласование оспариваний</div><div class="text-xs text-slate-500">Согласующие, веса, правило (${(App._policies || []).length})</div></div>
               ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>
+          </div>
+        </section>
+        <section>
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Система</h2>
+          <div class="space-y-2">
+            <button data-action="open-journal" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+              <div class="w-10 h-10 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("file", "w-5 h-5")}</div>
+              <div class="flex-1"><div class="font-medium text-sm">Журнал действий</div><div class="text-xs text-slate-500">Кто что менял</div></div>
+              ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>
+            <div class="flex gap-2">
+              <button data-action="backup-export" class="tnk-press flex-1 h-12 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm font-medium inline-flex items-center justify-center gap-2 text-slate-700 dark:text-slate-200">${UI.icon("download", "w-4 h-4")}Скачать бэкап</button>
+              <button data-action="backup-import" class="tnk-press flex-1 h-12 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm font-medium inline-flex items-center justify-center gap-2 text-slate-700 dark:text-slate-200">${UI.icon("save", "w-4 h-4")}Восстановить</button>
+            </div>
+            <input id="backupInput" type="file" accept="application/json,.json" class="hidden">
           </div>
         </section>
       </main>`;
@@ -2552,16 +3323,51 @@ const App = {
         </div></footer>`;
     },
 
+    concepts() {
+      if (!App.can("geo.manage")) return App.screens.home();
+      const rows = App._concepts.map(c => {
+        const rc = App._geo.filter(n => n.conceptId === c.id).length;
+        return `<div class="flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div class="w-9 h-9 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("layers", "w-5 h-5")}</div>
+          <div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${Reports._esc(c.name)}</div><div class="text-xs text-slate-500">${rc} ресторан(ов)</div></div>
+          <button data-action="concept-del" data-id="${c.id}" aria-label="Удалить" class="tnk-press shrink-0 w-8 h-8 grid place-items-center rounded-lg text-slate-400">${UI.icon("trash", "w-4 h-4")}</button>
+        </div>`; }).join("");
+      return App.appBar("Концепции (бренды)", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-3">
+        <p class="text-[13px] text-slate-500 dark:text-slate-400">Бренды сети. Один бренд может быть в разных городах и странах. Каждый ресторан привязывается к бренду в разделе «География».</p>
+        <button data-action="concept-add" class="tnk-press w-full h-12 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-500">+ Добавить концепцию</button>
+        ${rows || '<div class="text-center text-sm text-slate-500 py-8">Пока пусто.</div>'}
+      </main>`;
+    },
+
+    departments_manage() {
+      if (!App.can("geo.manage") && !App.can("checklist.edit")) return App.screens.home();
+      const rows = App._departments.slice().sort((a, b) => (a.order || 0) - (b.order || 0)).map(dep => {
+        const cnt = App._catCount ? (App._catCount[dep.id] || 0) : 0;
+        return `<div class="flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+          <div class="w-9 h-9 shrink-0 grid place-items-center rounded-xl bg-brand/10 text-brand">${UI.icon("store", "w-5 h-5")}</div>
+          <div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${Reports._esc(dep.name)}</div><div class="text-xs text-slate-500">${cnt ? cnt + " категорий" : "нет чек-листа"}</div></div>
+          <button data-action="dept-del" data-id="${dep.id}" data-has="${cnt ? 1 : ""}" aria-label="Удалить" class="tnk-press shrink-0 w-8 h-8 grid place-items-center rounded-lg text-slate-400">${UI.icon("trash", "w-4 h-4")}</button>
+        </div>`; }).join("");
+      return App.appBar("Подразделения", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-3">
+        <p class="text-[13px] text-slate-500 dark:text-slate-400">Участки проверки (Бар, Кухня, Зал, Склад…). Чек-листы к ним настраиваются в Конструкторе. Можно добавлять новые.</p>
+        <button data-action="dept-add" class="tnk-press w-full h-12 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-500">+ Добавить подразделение</button>
+        ${rows || '<div class="text-center text-sm text-slate-500 py-8">Пока пусто.</div>'}
+      </main>`;
+    },
+
     geo() {
       if (!App.can("geo.manage")) return App.screens.home();
       const list = App._geo;
+      const conceptOptions = (sel) => `<option value="">— бренд —</option>` + App._concepts.map(c => `<option value="${c.id}" ${sel === c.id ? "selected" : ""}>${Reports._esc(c.name)}</option>`).join("");
       const row = (n, depth) => {
         const adds = Geo.CHILD[n.type].map(t =>
           `<button data-action="geo-add" data-parent="${n.id}" data-type="${t}" class="tnk-press shrink-0 text-[11px] font-semibold text-brand px-2 h-7 rounded-lg bg-brand/5">+ ${Geo.TYPES[t]}</button>`).join("");
+        const conceptSel = n.type === "restaurant" && App._concepts.length
+          ? `<select data-field="rest-concept" data-id="${n.id}" class="shrink-0 h-7 text-[11px] px-1.5 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">${conceptOptions(n.conceptId)}</select>` : "";
         return `<div class="flex items-center gap-2 py-2.5 border-b border-slate-100 dark:border-slate-800" style="margin-left:${depth * 16}px">
           <span class="shrink-0 text-[11px] px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">${Geo.TYPES[n.type]}</span>
           <span class="flex-1 min-w-0 text-sm font-medium truncate">${Reports._esc(n.name)}</span>
-          ${adds}
+          ${conceptSel}${adds}
           <button data-action="geo-del" data-id="${n.id}" aria-label="Удалить" class="tnk-press shrink-0 w-7 h-7 grid place-items-center rounded-lg text-slate-400">${UI.icon("trash", "w-4 h-4")}</button>
         </div>` + Geo.children(list, n.id).map(c => row(c, depth + 1)).join("");
       };
@@ -2576,21 +3382,68 @@ const App = {
       if (!App.can("org.manage")) return App.screens.home();
       const list = App._positions;
       const kids = (pid) => list.filter(p => (p.parentId || null) === (pid || null));
-      const row = (p, depth) => `<div class="flex items-center gap-2 py-2.5 border-b border-slate-100 dark:border-slate-800" style="margin-left:${depth * 16}px">
-          <span class="flex-1 min-w-0 text-sm font-medium truncate">${Reports._esc(p.title)}</span>
-          <button data-action="pos-add" data-parent="${p.id}" class="tnk-press shrink-0 text-[11px] font-semibold text-brand px-2 h-7 rounded-lg bg-brand/5">+ подчинённый</button>
+      const roleNames = (p) => (App._roles || []).filter(r => (p.roleIds || []).includes(r.id)).map(r => r.name).join(", ");
+      const row = (p, depth) => `<div class="flex items-center gap-2 py-2 border-b border-slate-100 dark:border-slate-800" style="margin-left:${depth * 16}px">
+          <button data-action="pos-edit" data-id="${p.id}" class="tnk-press flex-1 min-w-0 text-left py-1">
+            <div class="text-sm font-medium truncate">${Reports._esc(p.title)}</div>
+            <div class="text-[11px] text-slate-500 truncate">${roleNames(p) || "без роли по умолчанию"}</div></button>
+          <button data-action="pos-new" data-parent="${p.id}" class="tnk-press shrink-0 text-[11px] font-semibold text-brand px-2 h-7 rounded-lg bg-brand/5">+ подчинённый</button>
           <button data-action="pos-del" data-id="${p.id}" aria-label="Удалить" class="tnk-press shrink-0 w-7 h-7 grid place-items-center rounded-lg text-slate-400">${UI.icon("trash", "w-4 h-4")}</button>
         </div>` + kids(p.id).map(c => row(c, depth + 1)).join("");
       const tree = kids(null).map(p => row(p, 0)).join("");
       return App.appBar("Должности", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6">
-        <p class="text-[13px] text-slate-500 dark:text-slate-400 mb-4">Иерархия «кто кому подчиняется». Верхний уровень — руководство; чем выше должность, тем выше ранг при закрытии нарушений и согласованиях.</p>
-        <button data-action="pos-add" class="tnk-press w-full h-12 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-500 mb-4">+ Добавить должность верхнего уровня</button>
+        <p class="text-[13px] text-slate-500 dark:text-slate-400 mb-4">Иерархия «кто кому подчиняется». Чем выше должность, тем выше ранг при закрытии нарушений и согласованиях. К должности можно привязать роль и область — пользователь наследует их.</p>
+        <button data-action="pos-new" class="tnk-press w-full h-12 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-500 mb-4">+ Добавить должность верхнего уровня</button>
         ${tree || '<div class="text-center text-sm text-slate-500 py-10">Пока пусто.</div>'}
       </main>`;
     },
 
+    position_edit() {
+      const d = App.adm.posDraft; if (!d || !App.can("org.manage")) return App.screens.home();
+      const isNew = !App._positions.some(p => p.id === d.id);
+      const parentTitle = d.parentId ? ((App._positions.find(p => p.id === d.parentId) || {}).title || "") : "";
+      const roleChecks = App._roles.map(r => `<label class="flex items-center gap-3 p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 cursor-pointer">
+        <input type="checkbox" data-field="pos-role" value="${r.id}" ${(d.roleIds || []).includes(r.id) ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]">
+        <span class="text-sm font-medium">${Reports._esc(r.name)}</span></label>`).join("");
+      return App.appBar(isNew ? "Новая должность" : "Должность", { back: "positions" }) + `<main class="max-w-3xl mx-auto px-4 py-6 pb-28 space-y-5">
+        ${parentTitle ? `<div class="text-[13px] text-slate-500">Подчиняется: <b>${Reports._esc(parentTitle)}</b></div>` : '<div class="text-[13px] text-slate-500">Верхний уровень (без руководителя)</div>'}
+        <div><label class="block text-sm font-medium mb-2">Название должности</label>
+          <input data-field="pos-title" value="${Reports._esc(d.title || "")}" placeholder="напр. Бренд-шеф" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm"></div>
+        <div><label class="block text-sm font-medium mb-2">Роль(и) по умолчанию</label>
+          <div class="text-xs text-slate-500 mb-2">Пользователь с этой должностью наследует выбранные роли (потом можно поправить лично).</div>
+          <div class="space-y-2">${roleChecks}</div></div>
+      </main>
+      <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
+        <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
+          <button data-route="positions" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отмена</button>
+          <button data-action="pos-save" class="tnk-press flex-[1.3] h-12 rounded-xl bg-brand text-white font-semibold text-sm">Сохранить</button>
+        </div></footer>`;
+    },
+
+    staff() {
+      if (!App.can("users.createLogin")) return App.screens.home();
+      const q = (App.adm.staffQuery || "").trim().toLowerCase();
+      let list = App.staffList();
+      if (q) list = list.filter(u => (u.name || "").toLowerCase().includes(q) || (u.login || "").toLowerCase().includes(q) || (u.position || "").toLowerCase().includes(q));
+      const rows = list.map((u) => { const initials = (u.name || "?").split(" ").map(s => s[0]).slice(0, 2).join("").toUpperCase();
+        const ava = u.photo ? `<img src="${u.photo}" alt="" class="w-10 h-10 rounded-full object-cover shrink-0">` : `<div class="w-10 h-10 shrink-0 grid place-items-center rounded-full bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-200 text-xs font-semibold">${initials}</div>`;
+        return `<button data-action="adm-staff-edit" data-id="${u.id}" class="tnk-press w-full flex items-center gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
+          ${ava}<div class="flex-1 min-w-0"><div class="text-sm font-medium truncate">${Reports._esc(u.name)}${u.active ? "" : ' <span class="text-[11px] text-slate-400">выключен</span>'}</div>
+            <div class="text-xs text-slate-500 truncate">@${Reports._esc(u.login || "")} · ${Reports._esc(u.position || "—")}</div></div>
+          ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`; }).join("");
+      return App.appBar("Сотрудники", { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6 space-y-3">
+        <div class="flex items-center justify-between">
+          <p class="text-[13px] text-slate-500 dark:text-slate-400">Сотрудники ниже вашей должности. Можно заводить и менять PIN.</p>
+          <button data-action="adm-staff-new" class="tnk-press inline-flex items-center gap-1 text-[13px] font-semibold text-brand shrink-0">${UI.icon("plus", "w-4 h-4")}Добавить</button>
+        </div>
+        <input id="staffSearch" data-field="staff-search" value="${Reports._esc(App.adm.staffQuery || "")}" placeholder="Поиск сотрудника…" class="w-full h-11 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">
+        <div class="space-y-2">${list.length ? rows : '<div class="text-sm text-slate-500 text-center py-6">Нет сотрудников.</div>'}</div>
+      </main>`;
+    },
+
     user_edit() {
-      const d = App.adm.uDraft; if (!d || !App.isAdmin()) return App.screens.home();
+      const d = App.adm.uDraft; if (!d || !(App.isAdmin() || App.can("users.createLogin"))) return App.screens.home();
+      const backRoute = App.adm._staffMode ? "staff" : "settings";
       const isNew = !App.users.some(u => u.id === d.id);
       const isSelf = App.user && d.id === App.user.id;
       const initials = (d.name || "?").trim().split(/\s+/).map(s => s[0]).slice(0, 2).join("").toUpperCase() || "?";
@@ -2602,7 +3455,7 @@ const App = {
       const roleChecks = App._roles.map(r => `<label class="flex items-center gap-3 p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 cursor-pointer">
         <input type="checkbox" data-field="u-role" value="${r.id}" ${(d.roleIds || []).includes(r.id) ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]">
         <span class="text-sm font-medium">${Reports._esc(r.name)}</span></label>`).join("");
-      return App.appBar(isNew ? "Новый пользователь" : "Пользователь", { back: "settings" }) + `<main class="max-w-3xl mx-auto px-4 py-6 pb-28 space-y-5">
+      return App.appBar(isNew ? "Новый пользователь" : "Пользователь", { back: backRoute }) + `<main class="max-w-3xl mx-auto px-4 py-6 pb-28 space-y-5">
         <div class="flex items-center gap-4">
           ${ava}
           <div class="space-y-2">
@@ -2622,16 +3475,37 @@ const App = {
           : input("u-position", "Должность", d.position, "например, Директор ресторана")}
         ${input("u-pin", "PIN (4–6 цифр)", d.pin, "••••", 'inputmode="numeric" maxlength="6"')}
         <div><label class="block text-sm font-medium mb-2">Роли</label><div class="space-y-2">${roleChecks}</div></div>
+        ${(function () {
+          const eff = App.effectivePerms(d), base = App.rolePerms(d);
+          const overridden = (d.permAdd || []).length + (d.permRemove || []).length;
+          const groups = PERMISSION_GROUPS.map(g => `<div class="px-1 pt-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400">${g.group}</div>` +
+            g.perms.map(p => { const on = eff.has("*") || eff.has(p.id); const fromRole = base.has("*") || base.has(p.id); const isOverride = on !== fromRole;
+              return `<label class="flex items-center gap-2 py-1.5 cursor-pointer"><input type="checkbox" data-field="u-perm" value="${p.id}" ${on ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]">
+                <span class="text-sm">${p.label}</span>${isOverride ? '<span class="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">индивид.</span>' : ""}</span></label>`; }).join("")).join("");
+          return `<details class="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-3">
+            <summary class="text-sm font-medium cursor-pointer select-none">Индивидуальные права${overridden ? ` · <span class="text-brand">${overridden} измен.</span>` : '<span class="text-xs text-slate-400"> — как у роли</span>'}</summary>
+            <div class="text-xs text-slate-500 mt-1 mb-2">Галочки берутся от ролей. Изменение здесь переопределяет право лично для этого пользователя.</div>
+            ${groups}</details>`;
+        })()}
         <div><label class="block text-sm font-medium mb-2">Область доступа</label>
-          ${App._geo.length ? `<div class="p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-            <div class="text-xs text-slate-500 mb-2">Отметьте узлы — доступ распространяется на всё вложенное. Пусто = без ограничений.</div>
+          <div class="text-xs text-slate-500 mb-2">Пусто в разделе = без ограничений по этой оси. Заполненные оси действуют вместе (И).</div>
+          ${App._concepts.length ? `<div class="p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 mb-2">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">Бренды</div>
+            ${App._concepts.map(c => `<label class="flex items-center gap-2 py-1 cursor-pointer"><input type="checkbox" data-field="u-concept" value="${c.id}" ${(d.conceptIds || []).includes(c.id) ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]"><span class="text-sm">${Reports._esc(c.name)}</span></label>`).join("")}
+          </div>` : ""}
+          ${App._geo.length ? `<div class="p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 mb-2">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">География</div>
             ${(function scopeTree(pid, depth) {
-              return Geo.children(App._geo, pid).map(n => `<label class="flex items-center gap-2 py-1.5 cursor-pointer" style="margin-left:${depth * 20}px">
+              return Geo.children(App._geo, pid).map(n => `<label class="flex items-center gap-2 py-1 cursor-pointer" style="margin-left:${depth * 20}px">
                 <input type="checkbox" data-field="u-scope" value="${n.id}" ${(d.scope || []).includes(n.id) ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]">
                 <span class="text-[11px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400">${Geo.TYPES[n.type]}</span>
                 <span class="text-sm">${Reports._esc(n.name)}</span></label>` + scopeTree(n.id, depth + 1)).join("");
             })(null, 0)}
-          </div>` : '<div class="text-[13px] text-slate-500 p-3 rounded-xl border border-dashed border-slate-300 dark:border-slate-700">География ещё не создана — доступ пока без ограничений.</div>'}
+          </div>` : ""}
+          ${App._departments.length ? `<div class="p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">Подразделения</div>
+            ${App._departments.map(dep => `<label class="flex items-center gap-2 py-1 cursor-pointer"><input type="checkbox" data-field="u-dept" value="${dep.id}" ${(d.deptIds || []).includes(dep.id) ? "checked" : ""} class="w-5 h-5 accent-[#EA1B24]"><span class="text-sm">${Reports._esc(dep.name)}</span></label>`).join("")}
+          </div>` : ""}
         </div>
         <label class="flex items-center gap-3 p-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 cursor-pointer ${isSelf ? "opacity-50" : ""}">
           <input type="checkbox" data-field="u-active" ${d.active ? "checked" : ""} ${isSelf ? "disabled" : ""} class="w-5 h-5 accent-[#EA1B24]">
@@ -2640,7 +3514,7 @@ const App = {
       </main>
       <footer class="fixed bottom-0 inset-x-0 z-20 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-t border-slate-200 dark:border-slate-800" style="padding-bottom:env(safe-area-inset-bottom)">
         <div class="max-w-3xl mx-auto px-4 py-3 flex gap-2">
-          <button data-route="settings" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отмена</button>
+          <button data-route="${backRoute}" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Отмена</button>
           <button data-action="adm-user-save" class="tnk-press flex-[1.3] h-12 rounded-xl bg-brand text-white font-semibold text-sm">Сохранить</button>
         </div></footer>`;
     },
