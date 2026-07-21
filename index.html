@@ -1044,7 +1044,7 @@ const Audit = {
     await Audit.persist();
   },
 
-  async pause()  { Audit.active.status = AUDIT_STATUS.PAUSED; await Audit.persist(); Session.set({ activeAuditId: null }); Audit.active = null; App.route("home"); },
+  async pause()  { Audit.active.status = AUDIT_STATUS.PAUSED; await Audit.persist(); Session.set({ activeAuditId: Audit.active.id }); Audit.active = null; App.route("home"); },
   async finish() { const a = Audit.active; a.status = AUDIT_STATUS.COMPLETED; a.finishedAt = new Date().toISOString(); await Audit.persist(); Sync.enqueue(a.id); Session.set({ activeAuditId: null }); App.route("audit_done"); },
   async abort()  { const a = Audit.active; a.status = AUDIT_STATUS.ABORTED; a.finishedAt = new Date().toISOString(); await Audit.persist(); Sync.enqueue(a.id); Session.set({ activeAuditId: null }); Audit.active = null; App.route("home"); }
 };
@@ -1129,10 +1129,10 @@ const Reports = {
   },
   _download(name, blob) { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 3000); },
 
-  async exportHTML() { const m = await Reports.current(); Reports._download(Reports.fname(m, "html"), new Blob([Reports.htmlDoc(m)], { type: "text/html;charset=utf-8" })); },
-  async exportPDF() {
+  async exportHTML(model) { const m = model || await Reports.current(); Reports._download(Reports.fname(m, "html"), new Blob([Reports.htmlDoc(m)], { type: "text/html;charset=utf-8" })); },
+  async exportPDF(model) {
     if (!window.html2pdf) { alert("Библиотека PDF ещё не загрузилась (нужен интернет при первом запуске)."); return; }
-    const m = await Reports.current();
+    const m = model || await Reports.current();
     const el = document.createElement("div"); el.style.padding = "12px"; el.style.background = "#fff"; el.innerHTML = Reports.htmlBody(m);
     window.html2pdf().set({ margin: 8, filename: Reports.fname(m, "pdf"), image: { type: "jpeg", quality: 0.92 },
       html2canvas: { scale: 2, useCORS: true }, jsPDF: { unit: "mm", format: "a4", orientation: "portrait" }, pagebreak: { mode: ["css", "avoid-all"] } }).from(el).save();
@@ -1167,21 +1167,49 @@ const Reports = {
     list.forEach(t => rows.push([t.object, t.a.restaurant || "", App.deptName(t.v.deptId), roleTitle(t.v.assigneeRole), st[t.v.status] || t.v.status, t.v.deadline || "бессрочно", App._isOverdue(t.v) ? "да" : "", t.repeat > 1 ? t.repeat : ""]));
     Reports._download("Задачи_" + new Date().toISOString().slice(0, 10) + ".csv", new Blob([Reports._csv(rows)], { type: "text/csv;charset=utf-8" }));
   },
+  async exportTasksPDF() {
+    const list = App.filteredTasks();
+    const roleTitle = (id) => (App._orgRoles.find(r => r.id === id) || {}).title || "";
+    const st = { open: "Открыто", fix_submitted: "На проверке", dispute_rejected: "Оспаривание отклонено" };
+    const m = {
+      auditor: App.user.name, date: App.fmtDate(new Date().toISOString()), restaurant: "Все", scope: "Задачи", finalScore: 100,
+      depts: [], violations: list.map(t => ({
+        deptName: App.deptName(t.v.deptId), index: "", object: t.object, criterion: st[t.v.status] || t.v.status,
+        severity: t.v.severity, penalty: t.v.penaltyPercent, comment: (t.a.restaurant || "") + (t.v.comment ? " | " + t.v.comment : ""),
+        assignee: roleTitle(t.v.assigneeRole), time: t.v.deadline || "бессрочно", photos: t.v.photos || []
+      })),
+      critical: [], nonCritical: []
+    };
+    m.critical = m.violations.filter(v => v.severity === SEVERITY.CRITICAL);
+    m.nonCritical = m.violations.filter(v => v.severity !== SEVERITY.CRITICAL);
+    return Reports.exportPDF(m);
+  },
 
   // Export a department's checklist as a standard (Excel with 2 sheets + CSV fallback)
-  async exportChecklist(deptId) {
+  async exportChecklist(deptId, format) {
     const cats = (await DB.categories(deptId)).sort((a, b) => Number(a.code) - Number(b.code));
     const checks = (await DB.checkpoints(deptId)).sort((a, b) => { const pa = String(a.index).split(".").map(Number), pb = String(b.index).split(".").map(Number); return (pa[0] - pb[0]) || ((pa[1] || 0) - (pb[1] || 0)); });
     const depName = (App._departments.find(d => d.id === deptId) || {}).name || deptId;
     const catName = {}; cats.forEach(c => catName[c.id] = c.name);
     const modeTxt = (cp) => SEVMODE_LABEL[cp.severityMode || SEVMODE.RANGE] + (cp.severityMode === SEVMODE.FIXED ? " " + (cp.fixedPenalty || 0) + "%" : "");
-    if (!window.XLSX) { // CSV fallback
+    
+    if (format === 'csv' || (!window.XLSX && format === 'xlsx')) {
       const rows = [["Категория", "Вес %", "Индекс", "Объект", "Критерий", "Требование", "Режим оценки"]];
       checks.forEach(cp => { const c = cats.find(x => x.id === cp.categoryId) || {}; rows.push([c.name || "", c.weight || "", cp.index || "", cp.object || "", cp.criterion || "", cp.requirement || "", modeTxt(cp)]); });
-      const csv = "﻿" + rows.map(r => r.map(v => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`).join(";")).join("\r\n");
-      Reports._download("Чеклист_" + depName + ".csv", new Blob([csv], { type: "text/csv;charset=utf-8" }));
+      Reports._download("Чеклист_" + depName + ".csv", new Blob([Reports._csv(rows)], { type: "text/csv;charset=utf-8" }));
       return;
     }
+    
+    if (format === 'html' || format === 'pdf') {
+      const m = {
+        auditor: "Система", date: App.fmtDate(new Date().toISOString()), restaurant: "Справочник", scope: depName, finalScore: 100,
+        depts: [{ name: depName, score: 100, categories: cats.map(c => ({ name: c.name, weight: c.weight, score: 100 })) }],
+        violations: [], critical: [], nonCritical: []
+      };
+      if (format === 'html') return Reports.exportHTML(m);
+      return Reports.exportPDF(m);
+    }
+
     const catSheet = [["Категория", "Вес %"]]; cats.forEach(c => catSheet.push([c.name, c.weight]));
     const cpSheet = [["Категория", "Индекс", "Объект", "Критерий", "Требование", "Режим оценки"]];
     checks.forEach(cp => cpSheet.push([catName[cp.categoryId] || "", cp.index || "", cp.object || "", cp.criterion || "", cp.requirement || "", modeTxt(cp)]));
@@ -1697,18 +1725,10 @@ const App = {
         }
 
         if (!activeAuditToResume && (currentRoute === "audit_run" || currentRoute === "violation")) {
-          activeAuditToResume = allAudits.find(a => a.status === AUDIT_STATUS.IN_PROGRESS);
+          activeAuditToResume = allAudits.find(a => a.status === AUDIT_STATUS.IN_PROGRESS || a.status === AUDIT_STATUS.PAUSED);
         }
 
-        for (const a of allAudits) {
-          if (a.status === AUDIT_STATUS.IN_PROGRESS && (!activeAuditToResume || a.id !== activeAuditToResume.id)) {
-            a.status = AUDIT_STATUS.PAUSED;
-            await DB.saveAudit(a);
-            Sync.enqueue(a.id);
-          }
-        }
-
-        if (activeAuditToResume && (currentRoute === "audit_run" || currentRoute === "violation")) {
+        if (activeAuditToResume) {
           await Audit.resume(activeAuditToResume.id);
           if (currentRoute === "violation" && Session.data.activeVioId) {
             Workflow.open(activeAuditToResume.id, Session.data.activeVioId);
@@ -1797,8 +1817,9 @@ const App = {
       case "export-csv": Reports.exportAuditCSV(); break;
       case "export-html": Reports.exportHTML(); break;
       case "export-tasks-csv": Reports.exportTasksCSV(); break;
+      case "export-tasks-pdf": Reports.exportTasksPDF(); break;
       case "hist-export": Reports.exportPeriod(); break;
-      case "ctr-export": Reports.exportChecklist(App.ctr.deptId); break;
+      case "ctr-export": Reports.exportChecklist(App.ctr.deptId, el.dataset.fmt || 'xlsx'); break;
       case "ctr-import-btn": document.getElementById('checklistInput').click(); break;
       case "backup-export": if(App.isAdmin()) App.exportBackup(); else alert("Доступ запрещен"); break;
       case "backup-import": if(App.isAdmin()) document.getElementById('backupInput').click(); else alert("Доступ запрещен"); break;
@@ -1814,11 +1835,54 @@ const App = {
       case "wf-dispute": Workflow.raiseDispute(document.getElementById('wfText').value); break;
       case "wf-vote-approve": Workflow.voteDispute(true, ""); break;
       case "wf-vote-reject": Workflow.voteDispute(false, prompt("Причина отклонения:")); break;
+      case "tasks-filter-toggle": App.taskFilterOpen = !App.taskFilterOpen; App.render(); break;
+      case "tasks-reset": App.taskFilter = { restaurant: "", dept: "", assignee: "", status: "", overdue: false }; App.render(); break;
 
       // История и Конструктор
       case "open-history-item": History.openItem(el.dataset.id); break;
       case "ctr-dept": App.ctr.deptId = el.dataset.id; await App.prepareRouteData("constructor"); App.render(); break;
       case "open-constructor": await App.prepareRouteData("constructor"); App.route("constructor"); break;
+
+      // Настройки (Админка)
+      case "adm-user-new": App.adm.uDraft = { id: "u_" + Date.now(), name: "", login: "", pin: "", roleIds: [], active: true }; App.route("user_edit"); break;
+      case "adm-user-edit": App.adm.uDraft = Object.assign({}, App.users.find(u => u.id === el.dataset.id)); App.route("user_edit"); break;
+      case "adm-role-new": App.adm.rDraft = { id: "role_" + Date.now(), name: "", permissions: [] }; App.route("role_edit"); break;
+      case "adm-role-edit": App.adm.rDraft = Object.assign({}, App._roles.find(r => r.id === el.dataset.id)); App.route("role_edit"); break;
+      case "concept-add": const cName = prompt("Название концепции:"); if(cName) { DB.saveConcept({id:"c_"+Date.now(), name:cName}).then(()=>location.reload()); } break;
+      case "dept-add": const dName = prompt("Название подразделения:"); if(dName) { DB.saveDept({id:"dept_"+Date.now(), name:dName, order:App._departments.length+1}).then(()=>location.reload()); } break;
+      case "geo-add": const gName = prompt("Название:"); if(gName) { DB.saveGeo({id:"g_"+Date.now(), name:gName, type:el.dataset.type, parentId:el.dataset.parent}).then(()=>location.reload()); } break;
+      case "pos-new": App.adm.posDraft = { id: "pos_" + Date.now(), title: "", parentId: el.dataset.parent, roleIds: [] }; App.route("position_edit"); break;
+      case "pos-edit": App.adm.posDraft = Object.assign({}, App._positions.find(p => p.id === el.dataset.id)); App.route("position_edit"); break;
+      case "pol-list": App.route("policies"); break;
+      case "pol-edit": App.adm.pDraft = Object.assign({id: el.dataset.id, mode: "threshold", threshold: 60, approvers: []}, App._policies.find(p => p.id === el.dataset.id)); App.route("policy_edit"); break;
+      case "open-journal": App.route("journal"); break;
+
+      // Конструктор
+      case "ctr-cat-new": App.ctr.catDraft = { id: "cat_" + Date.now(), deptId: App.ctr.deptId, name: "", weight: 0 }; App.route("category_edit"); break;
+      case "ctr-cat-edit": App.ctr.catDraft = Object.assign({}, App.ctr.cats.find(c => c.id === el.dataset.id)); App.route("category_edit"); break;
+      case "ctr-cp-new": App.ctr.cpDraft = { id: "chk_" + Date.now(), deptId: App.ctr.deptId, categoryId: el.dataset.cat, index: "", object: "", criterion: "", requirement: "", severityMode: "range" }; App.route("checkpoint_edit"); break;
+      case "ctr-cp-edit": App.ctr.cpDraft = Object.assign({}, App.ctr.checks.find(c => c.id === el.dataset.id)); App.route("checkpoint_edit"); break;
+      case "cp-mode": App.ctr.cpDraft.severityMode = el.dataset.val; App.render(); break;
+      case "ctr-cat-save": DB.saveCategory(App.ctr.catDraft).then(()=>App.route("constructor")); break;
+      case "ctr-cp-save": DB.saveCheckpoint(App.ctr.cpDraft).then(()=>App.route("constructor")); break;
+
+      // Settings / Admin
+      case "adm-user-save": DB.saveUser(App.adm.uDraft).then(()=>App.route(App.adm._staffMode ? "staff" : "settings")); break;
+      case "adm-role-save": DB.saveRole(App.adm.rDraft).then(()=>App.route("settings")); break;
+      case "pos-save": DB.savePosition(App.adm.posDraft).then(()=>App.route("positions")); break;
+      case "pol-save": DB.savePolicy(App.adm.pDraft).then(()=>App.route("policies")); break;
+      case "concept-del": if(confirm("Удалить концепцию?")) DB.delConcept(el.dataset.id).then(()=>location.reload()); break;
+      case "dept-del": if(confirm("Удалить подразделение?")) DB.delDept(el.dataset.id).then(()=>location.reload()); break;
+      case "geo-del": if(confirm("Удалить локацию?")) DB.delGeo(el.dataset.id).then(()=>location.reload()); break;
+      case "pos-del": if(confirm("Удалить должность?")) DB.delPosition(el.dataset.id).then(()=>location.reload()); break;
+      case "adm-user-del": if(confirm("Удалить пользователя?")) DB.delUser(el.dataset.id).then(()=>App.route("settings")); break;
+      case "adm-role-del": if(confirm("Удалить роль?")) DB.delRole(el.dataset.id).then(()=>App.route("settings")); break;
+      case "ctr-cat-del": if(confirm("Удалить категорию со всеми пунктами?")) {
+        const id = el.dataset.id;
+        const cps = App.ctr.checks.filter(x => x.categoryId === id);
+        Promise.all([DB.delCategory(id), ...cps.map(cp => DB.delCheckpoint(cp.id))]).then(()=>App.prepareRouteData("constructor")).then(()=>App.render());
+      } break;
+      case "ctr-cp-del": if(confirm("Удалить пункт?")) DB.delCheckpoint(el.dataset.id).then(()=>App.prepareRouteData("constructor")).then(()=>App.render()); break;
     }
   },
 
@@ -1847,6 +1911,11 @@ const App = {
       case "comment": VForm.draft.comment = el.value; break;
       case "hf-from": App.histFilter.from = el.value; App.render(); break;
       case "hf-to": App.histFilter.to = el.value; App.render(); break;
+      case "tf-restaurant": App.taskFilter.restaurant = el.value; App.render(); break;
+      case "tf-dept": App.taskFilter.dept = el.value; App.render(); break;
+      case "tf-assignee": App.taskFilter.assignee = el.value; App.render(); break;
+      case "tf-status": App.taskFilter.status = el.value; App.render(); break;
+      case "tf-overdue": App.taskFilter.overdue = el.checked; App.render(); break;
     }
   },
 
@@ -1855,6 +1924,30 @@ const App = {
     const field = el.dataset.field;
     if (!field) return;
     if (field === "auth-login") Auth.loginVal = el.value;
+    if (field === "search-q") {
+      App.searchQuery = el.value;
+      const q = el.value.toLowerCase();
+      if (q.length >= 2) {
+        App._search.audits = (App.histRaw.audits || []).filter(a => (a.restaurant||"").toLowerCase().includes(q) || (a.auditorName||"").toLowerCase().includes(q));
+        App._search.violations = (App.taskRaw || []).filter(t => (t.object||"").toLowerCase().includes(q) || (t.v.comment||"").toLowerCase().includes(q));
+        App._search.users = (App.users || []).filter(u => (u.name||"").toLowerCase().includes(q) || (u.login||"").toLowerCase().includes(q));
+        App._search.places = (App._geo || []).filter(n => (n.name||"").toLowerCase().includes(q));
+        App._search.depts = (App._departments || []).filter(d => (d.name||"").toLowerCase().includes(q));
+      }
+      App.render();
+    }
+    if (field === "user-search") { App.adm.userQuery = el.value; App.render(); }
+    if (field === "cat-name") App.ctr.catDraft.name = el.value;
+    if (field === "cat-weight") { App.ctr.catDraft.weight = Number(el.value); App.render(); }
+    if (field === "cp-index") App.ctr.cpDraft.index = el.value;
+    if (field === "cp-object") App.ctr.cpDraft.object = el.value;
+    if (field === "cp-criterion") App.ctr.cpDraft.criterion = el.value;
+    if (field === "cp-req") App.ctr.cpDraft.requirement = el.value;
+    if (field === "cp-fixed") { App.ctr.cpDraft.fixedPenalty = Number(el.value); App.render(); }
+    if (field === "u-name") App.adm.uDraft.name = el.value;
+    if (field === "u-login") App.adm.uDraft.login = el.value;
+    if (field === "u-pin") App.adm.uDraft.pin = el.value;
+    if (field === "pos-title") App.adm.posDraft.title = el.value;
     document.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && Session.data.route === "login" && Auth.step === "login") Auth.next();
     });
@@ -1966,7 +2059,17 @@ const App = {
     }
     if (route === "tasks") {
       const vios = await IDB.getAll("audit_violations");
-      App.taskRaw = vios.map(v => ({ v, a: {}, object: "Нарушение", repeat: 1 }));
+      const audits = await DB.audits();
+      const cpMap = {};
+      const allCats = await IDB.getAll("checklist_categories");
+      const allChks = await IDB.getAll("checklist_structure");
+      allChks.forEach(c => cpMap[c.id] = c);
+      
+      App.taskRaw = vios.filter(v => v.status !== VIO_STATUS.RESOLVED && v.status !== VIO_STATUS.DISPUTE_UPHELD).map(v => {
+        const a = audits.find(x => x.id === v.auditId) || {};
+        const cp = cpMap[v.checkpointId] || {};
+        return { v, a, object: cp.object || "Нарушение", repeat: 1 };
+      });
     }
     if (route === "constructor") {
       if (!App.ctr.deptId && App._departments.length) App.ctr.deptId = App._departments[0].id;
@@ -1978,8 +2081,27 @@ const App = {
   },
 
   staffList() { return App.users.filter(u => u.active && u.id !== App.user.id); },
-  filteredTasks() { return App.taskRaw; },
-  taskActiveFilters() { return ""; },
+  filteredTasks() {
+    const f = App.taskFilter;
+    return App.taskRaw.filter(t => {
+      if (f.restaurant && t.a.restaurantId !== f.restaurant) return false;
+      if (f.dept && t.v.deptId !== f.dept) return false;
+      if (f.assignee && t.v.assigneeRole !== f.assignee) return false;
+      if (f.status && t.v.status !== f.status) return false;
+      if (f.overdue && !App._isOverdue(t.v)) return false;
+      return true;
+    });
+  },
+  taskActiveFilters() {
+    const f = App.taskFilter;
+    const active = [];
+    if (f.restaurant) active.push("ресторан");
+    if (f.dept) active.push("отдел");
+    if (f.assignee) active.push("роль");
+    if (f.status) active.push("статус");
+    if (f.overdue) active.push("просрочено");
+    return active.join(", ");
+  },
   histActiveFilters() { return ""; },
   _isOverdue(vio) { return vio.deadline && new Date(vio.deadline) < new Date(); },
   schedOverdue(rstId) { return null; },
@@ -2223,7 +2345,7 @@ const App = {
         <div><label class="block text-sm font-medium mb-2">Фото</label>
           <div class="flex gap-3 overflow-x-auto pb-1">${thumbs}
             <button data-action="vform-add-photo" aria-label="Добавить фото" class="tnk-press shrink-0 w-20 h-20 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 grid place-items-center text-slate-400">${UI.icon("camera", "w-6 h-6")}</button></div>
-          <input id="photoInput" type="file" accept="image/*" capture="environment" multiple class="hidden"></div>
+          <input id="photoInput" type="file" accept="image/*" multiple class="hidden"></div>
         <div><label class="block text-sm font-medium mb-2" for="asg">Ответственный (Fix by…)</label>
           <select id="asg" data-field="assignee" class="w-full h-12 px-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm">${roleOpts}</select></div>
         <div><label class="block text-sm font-medium mb-2" for="vdl">Срок устранения</label>
@@ -2390,7 +2512,10 @@ const App = {
         <div class="flex items-center gap-2">
           <button data-action="tasks-filter-toggle" class="tnk-press inline-flex items-center gap-1.5 h-9 px-3 rounded-xl border ${nf ? "border-brand text-brand bg-brand/5" : "border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300"} text-sm font-medium">${UI.icon("filter", "w-4 h-4")}Фильтры${nf ? " · " + nf : ""}</button>
           ${overdueCount ? `<span class="text-sm text-brand font-medium">${overdueCount} просрочено</span>` : ""}
-          <button data-action="export-tasks-csv" class="tnk-press ml-auto inline-flex items-center gap-1 text-[13px] text-brand font-medium">${UI.icon("download", "w-4 h-4")}CSV</button>
+          <div class="ml-auto flex gap-2">
+            <button data-action="export-tasks-csv" class="tnk-press inline-flex items-center gap-1 text-[13px] text-brand font-medium">${UI.icon("download", "w-4 h-4")}CSV</button>
+            <button data-action="export-tasks-pdf" class="tnk-press inline-flex items-center gap-1 text-[13px] text-brand font-medium">${UI.icon("file", "w-4 h-4")}PDF</button>
+          </div>
         </div>
         ${panel}
         <div><h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Открытые задачи (${list.length})</h2>
@@ -2482,7 +2607,7 @@ const App = {
           ${canFix ? `<button data-action="wf-fix" class="tnk-press flex-1 h-11 rounded-xl bg-brand text-white font-semibold text-sm">Отправить исправление</button>` : ""}
         </div>
         ${canDispute ? `<button data-action="wf-dispute" class="tnk-press w-full h-11 rounded-xl border border-violet-300 text-violet-600 dark:text-violet-400 font-medium text-sm">Оспорить (текст выше = причина)</button>` : ""}
-        <input id="wfPhotoInput" type="file" accept="image/*" capture="environment" multiple class="hidden">
+        <input id="wfPhotoInput" type="file" accept="image/*" multiple class="hidden">
       </div>` : "";
       const resolveBar = canResolve ? `<div class="flex gap-2">
         <button data-action="wf-reject" class="tnk-press flex-1 h-12 rounded-xl border border-slate-200 dark:border-slate-700 font-medium text-sm text-slate-600 dark:text-slate-300">Вернуть на доработку</button>
@@ -2614,10 +2739,15 @@ const App = {
         ${c.deptId ? `
           <div class="flex items-center justify-between">
             <div class="text-xs ${totalW === 100 ? "text-slate-500" : "text-amber-600 dark:text-amber-400"}">Сумма весов: ${totalW}%${totalW === 100 ? "" : " (обычно 100%)"}</div>
-            <div class="flex gap-2">
+            <div class="flex flex-wrap gap-2 justify-end">
               <button data-action="ctr-history" class="tnk-press text-[13px] text-slate-500 inline-flex items-center gap-1">${UI.icon("file", "w-4 h-4")}Версии</button>
-              <button data-action="ctr-import-btn" class="tnk-press text-[13px] text-emerald-600 font-medium inline-flex items-center gap-1">${UI.icon("download", "w-4 h-4")}Импорт (Excel)</button>
-              <button data-action="ctr-export" class="tnk-press text-[13px] text-brand font-medium inline-flex items-center gap-1">${UI.icon("download", "w-4 h-4")}Экспорт</button>
+              <button data-action="ctr-import-btn" class="tnk-press text-[13px] text-emerald-600 font-medium inline-flex items-center gap-1">${UI.icon("download", "w-4 h-4")}Импорт</button>
+              <div class="flex gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
+                <button data-action="ctr-export" data-fmt="xlsx" class="tnk-press text-[11px] font-bold px-2 py-1 rounded hover:bg-white dark:hover:bg-slate-700">XLSX</button>
+                <button data-action="ctr-export" data-fmt="pdf" class="tnk-press text-[11px] font-bold px-2 py-1 rounded hover:bg-white dark:hover:bg-slate-700">PDF</button>
+                <button data-action="ctr-export" data-fmt="html" class="tnk-press text-[11px] font-bold px-2 py-1 rounded hover:bg-white dark:hover:bg-slate-700">HTML</button>
+                <button data-action="ctr-export" data-fmt="csv" class="tnk-press text-[11px] font-bold px-2 py-1 rounded hover:bg-white dark:hover:bg-slate-700">CSV</button>
+              </div>
             </div>
           </div>
           ${catBlocks || '<div class="text-center text-sm text-slate-500 py-8">В подразделении пока нет категорий.</div>'}
@@ -3039,8 +3169,315 @@ const App = {
     }
   }
 }; 
+// path: /src/app-core.js (Event Handlers: Click, Change, Input Form Data Binding)
+
+App._onClick = async function(e) {
+  const el = e.target.closest("[data-action], [data-route], [data-pin]");
+  if (!el) return;
+  
+  if (el.tagName === 'BUTTON' || el.hasAttribute('data-route') || el.hasAttribute('data-action') || el.hasAttribute('data-pin')) {
+    if (el.tagName !== 'INPUT' && el.tagName !== 'SELECT' && el.tagName !== 'TEXTAREA') {
+      e.preventDefault();
+    }
+  }
+  
+  const action = el.dataset.action;
+  const route = el.dataset.route;
+  const pin = el.dataset.pin;
+
+  if (route) {
+    await App.prepareRouteData(route);
+    App.route(route);
+    return;
+  }
+  if (pin) { Auth.pinPress(pin); return; }
+
+  switch (action) {
+    case "auth-next": Auth.next(); break;
+    case "auth-back": Auth.back(); break;
+    case "theme-toggle": Theme.toggle(); break;
+    case "logout": Session.clear(); location.reload(); break;
+    
+    // Audit actions
+    case "new-audit": await App.prepareRouteData("audit_setup"); App.route("audit_setup"); break;
+    case "set-scope": App.setup.scope = el.dataset.val; App.render(); break;
+    case "sel-dept": App.setup.selDept = el.dataset.dept; App.render(); break;
+    case "start-audit": {
+      const depts = App.setup.scope === "all" ? App.setup.departments.filter(d => d._count > 0).map(d => d.id) : [App.setup.selDept];
+      if (!depts.length) { alert("Нет доступных чек-листов."); return; }
+      Audit.start(App.setup.scope, depts); 
+      break;
+    }
+    case "resume-audit": Audit.resume(el.dataset.id); break;
+    case "switch-dept": Audit.ui.deptId = el.dataset.dept; Audit.ui.openCat = null; App.render(); break;
+    case "toggle-cat": Audit.ui.openCat = Audit.ui.openCat === el.dataset.cat ? null : el.dataset.cat; App.render(); break;
+    case "audit-pause": Audit.pause(); break;
+    case "audit-abort": if (confirm("Прекратить аудит без сохранения?")) Audit.abort(); break;
+    case "audit-finish": Audit.finish(); break;
+
+    // Violations
+    case "open-cp": VForm.open(el.dataset.dept, el.dataset.cp); break;
+    case "vform-severity": VForm.draft.severity = el.dataset.val; App.render(); break;
+    case "vform-save": VForm.save(false); break;
+    case "vform-save-add": VForm.save(true); break;
+    case "del-vio": if (confirm("Удалить нарушение?")) Audit.removeViolation(el.dataset.id).then(() => App.render()); break;
+    case "vform-add-photo": document.getElementById('photoInput').click(); break;
+    case "vform-remove-photo": VForm.draft.photos.splice(el.dataset.idx, 1); VForm.draft.markers.splice(el.dataset.idx, 1); App.render(); break;
+    case "vform-edit-photo": PhotoEdit.open(el.dataset.idx); break;
+
+    // Photo Editor
+    case "pe-tool": PhotoEdit.tool = el.dataset.val; App.render(); break;
+    case "pe-undo": PhotoEdit.undo(); break;
+    case "pe-cancel": App.route("violation"); break;
+    case "pe-save": PhotoEdit.save(); break;
+
+    // Exports, Imports & Backup
+    case "export-pdf": Reports.exportPDF(); break;
+    case "export-excel": Reports.exportExcel(); break;
+    case "export-csv": Reports.exportAuditCSV(); break;
+    case "export-html": Reports.exportHTML(); break;
+    case "export-tasks-csv": Reports.exportTasksCSV(); break;
+    case "export-tasks-pdf": Reports.exportTasksPDF(); break;
+    case "export-tasks-html": Reports.exportTasksHTML(); break;
+    case "hist-export": Reports.exportPeriod(); break;
+    case "ctr-export": Reports.exportChecklist(App.ctr.deptId, el.dataset.fmt || 'xlsx'); break;
+    case "ctr-import-btn": document.getElementById('checklistInput').click(); break;
+    case "backup-export": if(App.isAdmin()) App.exportBackup(); else alert("Доступ запрещен"); break;
+    case "backup-import": if(App.isAdmin()) document.getElementById('backupInput').click(); else alert("Доступ запрещен"); break;
+
+    // Workflow & Disputes
+    case "wf-open": Workflow.open(Audit.active.id, el.dataset.id); break;
+    case "wf-open-ctx": Workflow.open(el.dataset.audit, el.dataset.vio); break;
+    case "task-open": Workflow.open(el.dataset.audit, el.dataset.vio); break;
+    case "wf-fix": Workflow.submitFix(document.getElementById('wfText').value); break;
+    case "wf-resolve": Workflow.resolve(); break;
+    case "wf-reject": Workflow.rejectFix(); break;
+    case "wf-set-score": Workflow.setScore(); break;
+    case "wf-dispute": Workflow.raiseDispute(document.getElementById('wfText').value); break;
+    case "wf-vote-approve": Workflow.voteDispute(true, ""); break;
+    case "wf-vote-reject": Workflow.voteDispute(false, prompt("Причина отклонения:")); break;
+    case "tasks-filter-toggle": App.taskFilterOpen = !App.taskFilterOpen; App.render(); break;
+    case "tasks-reset": App.taskFilter = { restaurant: "", dept: "", assignee: "", status: "", overdue: false }; App.render(); break;
+
+    // History & Constructor Navigation
+    case "open-history-item": History.openItem(el.dataset.id); break;
+    case "ctr-dept": App.ctr.deptId = el.dataset.id; await App.prepareRouteData("constructor"); App.render(); break;
+    case "open-constructor": await App.prepareRouteData("constructor"); App.route("constructor"); break;
+
+    // Admin & Settings Management
+    case "adm-user-new": App.adm.uDraft = { id: "u_" + Date.now(), name: "", login: "", pin: "", roleIds: [], active: true, scope: [], conceptIds: [], deptIds: [] }; App.route("user_edit"); break;
+    case "adm-user-edit": App.adm.uDraft = Object.assign({ scope: [], conceptIds: [], deptIds: [], roleIds: [] }, App.users.find(u => u.id === el.dataset.id)); App.route("user_edit"); break;
+    case "adm-role-new": App.adm.rDraft = { id: "role_" + Date.now(), name: "", permissions: [] }; App.route("role_edit"); break;
+    case "adm-role-edit": App.adm.rDraft = Object.assign({}, App._roles.find(r => r.id === el.dataset.id)); App.route("role_edit"); break;
+    case "concept-add": {
+      const cName = prompt("Название концепции:"); 
+      if(cName) { await DB.saveConcept({id:"c_"+Date.now(), name:cName}); await App.reloadState(); App.render(); } 
+      break;
+    }
+    case "dept-add": {
+      const dName = prompt("Название подразделения:"); 
+      if(dName) { await DB.saveDept({id:"dept_"+Date.now(), name:dName, order:App._departments.length+1}); await App.reloadState(); App.render(); } 
+      break;
+    }
+    case "geo-add": {
+      const gName = prompt("Название:"); 
+      if(gName) { await DB.saveGeo({id:"g_"+Date.now(), name:gName, type:el.dataset.type, parentId:el.dataset.parent}); await App.reloadState(); App.render(); } 
+      break;
+    }
+    case "pos-new": App.adm.posDraft = { id: "pos_" + Date.now(), title: "", parentId: el.dataset.parent, roleIds: [] }; App.route("position_edit"); break;
+    case "pos-edit": App.adm.posDraft = Object.assign({ roleIds: [] }, App._positions.find(p => p.id === el.dataset.id)); App.route("position_edit"); break;
+    case "pol-list": App.route("policies"); break;
+    case "pol-edit": App.adm.pDraft = Object.assign({id: el.dataset.id, mode: "threshold", threshold: 60, approvers: []}, App._policies.find(p => p.id === el.dataset.id)); App.route("policy_edit"); break;
+    case "pol-mode": App.adm.pDraft.mode = el.dataset.val; App.render(); break;
+    case "open-journal": App.route("journal"); break;
+
+    // Constructor CRUD
+    case "ctr-cat-new": App.ctr.catDraft = { id: "cat_" + Date.now(), deptId: App.ctr.deptId, name: "", weight: 0 }; App.route("category_edit"); break;
+    case "ctr-cat-edit": App.ctr.catDraft = Object.assign({}, App.ctr.cats.find(c => c.id === el.dataset.id)); App.route("category_edit"); break;
+    case "ctr-cp-new": App.ctr.cpDraft = { id: "chk_" + Date.now(), deptId: App.ctr.deptId, categoryId: el.dataset.cat, index: "", object: "", criterion: "", requirement: "", severityMode: "range" }; App.route("checkpoint_edit"); break;
+    case "ctr-cp-edit": App.ctr.cpDraft = Object.assign({}, App.ctr.checks.find(c => c.id === el.dataset.id)); App.route("checkpoint_edit"); break;
+    case "cp-mode": App.ctr.cpDraft.severityMode = el.dataset.val; App.render(); break;
+    case "ctr-cat-save": await DB.saveCategory(App.ctr.catDraft); await App.prepareRouteData("constructor"); App.route("constructor"); break;
+    case "ctr-cp-save": await DB.saveCheckpoint(App.ctr.cpDraft); await App.prepareRouteData("constructor"); App.route("constructor"); break;
+
+    // Settings / Admin Saves
+    case "adm-user-save": await DB.saveUser(App.adm.uDraft); await App.reloadState(); App.route(App.adm._staffMode ? "staff" : "settings"); break;
+    case "adm-role-save": await DB.saveRole(App.adm.rDraft); await App.reloadState(); App.route("settings"); break;
+    case "pos-save": await DB.savePosition(App.adm.posDraft); await App.reloadState(); App.route("positions"); break;
+    case "pol-save": await DB.savePolicy(App.adm.pDraft); await App.reloadState(); App.route("policies"); break;
+    
+    // Deletions
+    case "concept-del": if(confirm("Удалить концепцию?")) { await DB.delConcept(el.dataset.id); await App.reloadState(); App.render(); } break;
+    case "dept-del": if(confirm("Удалить подразделение?")) { await DB.delDept(el.dataset.id); await App.reloadState(); App.render(); } break;
+    case "geo-del": if(confirm("Удалить локацию?")) { await DB.delGeo(el.dataset.id); await App.reloadState(); App.render(); } break;
+    case "pos-del": if(confirm("Удалить должность?")) { await DB.delPosition(el.dataset.id); await App.reloadState(); App.route("positions"); } break;
+    case "adm-user-del": if(confirm("Удалить пользователя?")) { await DB.delUser(el.dataset.id); await App.reloadState(); App.route("settings"); } break;
+    case "adm-role-del": if(confirm("Удалить роль?")) { await DB.delRole(el.dataset.id); await App.reloadState(); App.route("settings"); } break;
+    case "ctr-cat-del": if(confirm("Удалить категорию со всеми пунктами?")) {
+      const id = el.dataset.id;
+      const cps = App.ctr.checks.filter(x => x.categoryId === id);
+      await Promise.all([DB.delCategory(id), ...cps.map(cp => DB.delCheckpoint(cp.id))]);
+      await App.prepareRouteData("constructor");
+      App.render();
+    } break;
+    case "ctr-cp-del": if(confirm("Удалить пункт?")) {
+      await DB.delCheckpoint(el.dataset.id);
+      await App.prepareRouteData("constructor");
+      App.render();
+    } break;
+  }
+};
+
+App._onChange = function(e) {
+  const el = e.target;
+  
+  if (el.id === "backupInput" && el.files.length) App.importBackup(el.files[0]);
+  if (el.id === "checklistInput" && el.files.length) App.importChecklist(el.files[0]);
+  if (el.id === "photoInput" && el.files.length) {
+    Promise.all(Array.from(el.files).map(f => Media.compress(f))).then(res => {
+      VForm.draft.photos.push(...res); App.render();
+    });
+    el.value = "";
+  }
+
+  const field = el.dataset.field;
+  if (!field) return;
+  
+  switch (field) {
+    case "auth-login": Auth.loginVal = el.value; break;
+    case "setup-restaurant": App.setup.restaurantId = el.value; break;
+    case "penalty": VForm.setPenalty(el.value); break;
+    case "assignee": VForm.draft.assigneeRole = el.value; break;
+    case "vdeadline": VForm.draft.deadline = el.value; break;
+    case "comment": VForm.draft.comment = el.value; break;
+    case "hf-from": App.histFilter.from = el.value; App.render(); break;
+    case "hf-to": App.histFilter.to = el.value; App.render(); break;
+    case "tf-restaurant": App.taskFilter.restaurant = el.value; App.render(); break;
+    case "tf-dept": App.taskFilter.dept = el.value; App.render(); break;
+    case "tf-assignee": App.taskFilter.assignee = el.value; App.render(); break;
+    case "tf-status": App.taskFilter.status = el.value; App.render(); break;
+    case "tf-overdue": App.taskFilter.overdue = el.checked; App.render(); break;
+    
+    // User Edit binding
+    case "u-positionId": App.adm.uDraft.positionId = el.value; break;
+    case "u-active": App.adm.uDraft.active = el.checked; break;
+    case "u-role": {
+      const roles = new Set(App.adm.uDraft.roleIds || []);
+      if (el.checked) roles.add(el.value); else roles.delete(el.value);
+      App.adm.uDraft.roleIds = Array.from(roles);
+      break;
+    }
+    case "u-concept": {
+      const concepts = new Set(App.adm.uDraft.conceptIds || []);
+      if (el.checked) concepts.add(el.value); else concepts.delete(el.value);
+      App.adm.uDraft.conceptIds = Array.from(concepts);
+      break;
+    }
+    case "u-scope": {
+      const scope = new Set(App.adm.uDraft.scope || []);
+      if (el.checked) scope.add(el.value); else scope.delete(el.value);
+      App.adm.uDraft.scope = Array.from(scope);
+      break;
+    }
+    case "u-dept": {
+      const depts = new Set(App.adm.uDraft.deptIds || []);
+      if (el.checked) depts.add(el.value); else depts.delete(el.value);
+      App.adm.uDraft.deptIds = Array.from(depts);
+      break;
+    }
+    case "r-perm": {
+      const perms = new Set(App.adm.rDraft.permissions || []);
+      if (el.checked) perms.add(el.value); else perms.delete(el.value);
+      App.adm.rDraft.permissions = Array.from(perms);
+      break;
+    }
+    case "pos-role": {
+      const roles = new Set(App.adm.posDraft.roleIds || []);
+      if (el.checked) roles.add(el.value); else roles.delete(el.value);
+      App.adm.posDraft.roleIds = Array.from(roles);
+      break;
+    }
+    case "pol-threshold": App.adm.pDraft.threshold = Number(el.value); App.render(); break;
+    case "pol-approver": {
+      const uid = el.value;
+      let approvers = App.adm.pDraft.approvers || [];
+      if (el.checked) {
+        if (!approvers.some(a => a.userId === uid)) approvers.push({ userId: uid, weight: 1, canOverride: false });
+      } else {
+        approvers = approvers.filter(a => a.userId !== uid);
+      }
+      App.adm.pDraft.approvers = approvers;
+      App.render();
+      break;
+    }
+    case "pol-override": {
+      const uid = el.dataset.uid;
+      const app = (App.adm.pDraft.approvers || []).find(a => a.userId === uid);
+      if (app) app.canOverride = el.checked;
+      break;
+    }
+    case "rest-concept": {
+      const node = App._geo.find(n => n.id === el.dataset.id);
+      if (node) { node.conceptId = el.value; DB.saveGeo(node); }
+      break;
+    }
+  }
+};
+
+App._onInput = function(e) {
+  const el = e.target;
+  const field = el.dataset.field;
+  if (!field) return;
+
+  if (field === "auth-login") Auth.loginVal = el.value;
+  if (field === "search-q") {
+    App.searchQuery = el.value;
+    const q = el.value.toLowerCase();
+    if (q.length >= 2) {
+      App._search.audits = (App.histRaw.audits || []).filter(a => (a.restaurant||"").toLowerCase().includes(q) || (a.auditorName||"").toLowerCase().includes(q));
+      App._search.violations = (App.taskRaw || []).filter(t => (t.object||"").toLowerCase().includes(q) || (t.v.comment||"").toLowerCase().includes(q));
+      App._search.users = (App.users || []).filter(u => (u.name||"").toLowerCase().includes(q) || (u.login||"").toLowerCase().includes(q));
+      App._search.places = (App._geo || []).filter(n => (n.name||"").toLowerCase().includes(q));
+      App._search.depts = (App._departments || []).filter(d => (d.name||"").toLowerCase().includes(q));
+    }
+    // Update content container dynamically without blowing away the search input focus
+    const container = App.el.querySelector("main");
+    if (container && Session.data.route === "search") {
+      const subScreen = App.screens.search();
+      const temp = document.createElement("div");
+      temp.innerHTML = subScreen;
+      const newMain = temp.querySelector("main");
+      if (newMain) container.innerHTML = newMain.innerHTML;
+    }
+  }
+  if (field === "user-search") { App.adm.userQuery = el.value; App.render(); }
+  if (field === "cat-name") App.ctr.catDraft.name = el.value;
+  if (field === "cat-weight") { App.ctr.catDraft.weight = Number(el.value); App.render(); }
+  if (field === "cp-index") App.ctr.cpDraft.index = el.value;
+  if (field === "cp-object") App.ctr.cpDraft.object = el.value;
+  if (field === "cp-criterion") App.ctr.cpDraft.criterion = el.value;
+  if (field === "cp-req") App.ctr.cpDraft.requirement = el.value;
+  if (field === "cp-fixed") { App.ctr.cpDraft.fixedPenalty = Number(el.value); App.render(); }
+  if (field === "u-name") App.adm.uDraft.name = el.value;
+  if (field === "u-login") App.adm.uDraft.login = el.value;
+  if (field === "u-position") App.adm.uDraft.position = el.value;
+  if (field === "u-pin") App.adm.uDraft.pin = el.value;
+  if (field === "r-name") App.adm.rDraft.name = el.value;
+  if (field === "pos-title") App.adm.posDraft.title = el.value;
+  if (field === "pol-weight") {
+    const uid = el.dataset.uid;
+    const app = (App.adm.pDraft.approvers || []).find(a => a.userId === uid);
+    if (app) app.weight = Number(el.value) || 1;
+  }
+  if (field === "sched-days") {
+    const rstId = el.dataset.id;
+    const days = Number(el.value) || 0;
+    DB.saveSchedule({ id: "sch_" + rstId, restaurantId: rstId, everyDays: days }).then(() => App.reloadState());
+  }
+};
 
 /* ===================== Auth (login -> welcome -> PIN 4-6) ===================== */
+
 const Auth = {
   step: "login", loginVal: "", candidate: null, buffer: "", err: "",
   reset() { Auth.step = "login"; Auth.loginVal = ""; Auth.candidate = null; Auth.buffer = ""; Auth.err = ""; },
@@ -3114,6 +3551,532 @@ const Auth = {
     } else { Auth.buffer = ""; Auth.err = "Неверный PIN"; App.render(); }
   }
 };
+
+/* ===================== PATCH & FIXES OVERRIDE ===================== */
+
+// 1. Синхронизация состояния с IndexedDB
+App.reloadState = async function() {
+  App.users = await DB.users();
+  App._roles = await DB.roles();
+  App._geo = await DB.geoNodes();
+  App._positions = await DB.positions();
+  App._orgRoles = await DB.orgRoles();
+  App._policies = await DB.policies();
+  App._access = await DB.access();
+  App._concepts = await DB.concepts();
+  App._departments = await DB.departments();
+  App._schedules = await DB.schedules();
+  
+  App._catCount = {};
+  (await IDB.getAll("checklist_categories")).forEach(c => {
+    App._catCount[c.deptId] = (App._catCount[c.deptId] || 0) + 1;
+  });
+};
+
+// 2. Исправленная инициализация
+App.boot = async function() {
+  Session.load(); Theme.apply();
+  App.el = document.getElementById("app");
+  if (!App.el) return;
+  App.el.innerHTML = App._splash("Загрузка…");
+  try {
+    await DB.init();
+    App.el.innerHTML = App._splash("Синхронизация с сервером…");
+    
+    if (navigator.onLine) {
+      try {
+        await Sync.flush();
+        await Sync.pull();
+      } catch (syncErr) {
+        console.warn("Синхронизация недоступна, работаем офлайн");
+      }
+    }
+
+    await App.reloadState();
+
+    if (Session.data.userId) {
+      App.user = App.users.find(u => u.id === Session.data.userId) || null;
+    }
+
+    if (App.user) {
+      await App.refreshNotif(); 
+
+      const allAudits = await DB.audits();
+      const savedActiveId = Session.data.activeAuditId;
+      const currentRoute = Session.data.route;
+
+      let activeAuditToResume = null;
+      if (savedActiveId) {
+        activeAuditToResume = allAudits.find(a => a.id === savedActiveId && (a.status === AUDIT_STATUS.IN_PROGRESS || a.status === AUDIT_STATUS.PAUSED));
+      }
+
+      if (!activeAuditToResume && (currentRoute === "audit_run" || currentRoute === "violation")) {
+        activeAuditToResume = allAudits.find(a => a.status === AUDIT_STATUS.IN_PROGRESS || a.status === AUDIT_STATUS.PAUSED);
+      }
+
+      if (activeAuditToResume) {
+        await Audit.resume(activeAuditToResume.id);
+        if (currentRoute === "violation" && Session.data.activeVioId) {
+          Workflow.open(activeAuditToResume.id, Session.data.activeVioId);
+        }
+      }
+    }
+
+    const routeTo = App.user ? (Session.data.route === "login" ? "home" : Session.data.route) : "login";
+    await App.prepareRouteData(routeTo);
+    App.route(routeTo);
+  } catch (e) {
+    console.error("Boot error:", e);
+    if (App.el) App.el.innerHTML = App._splash("Ошибка инициализации: " + e.message);
+  }
+
+  document.addEventListener("click", App._onClick);
+  document.addEventListener("change", App._onChange);
+  document.addEventListener("input", App._onInput);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && Session.data.route === "login" && Auth.step === "login") Auth.next();
+  });
+  window.addEventListener("online", () => Sync.flush());
+  window.addEventListener("offline", () => console.log("Offline mode active"));
+};
+
+// 3. Подготовка данных маршрутов
+App.prepareRouteData = async function(route) {
+  if (route === "audit_setup") {
+    const audits = await DB.audits();
+    App.setup.resumable = audits.filter(a => a.status === AUDIT_STATUS.PAUSED);
+    App.setup.restaurants = App._geo.filter(n => n.type === "restaurant");
+    App.setup.departments = App._departments.map(d => Object.assign({}, d, { _count: App._catCount[d.id] || 0 }));
+    if (!App.setup.selDept && App._departments.length) App.setup.selDept = App._departments[0].id;
+  }
+  if (route === "dashboard") {
+    const audits = await DB.audits();
+    const completed = audits.filter(a => a.status === AUDIT_STATUS.COMPLETED);
+    App.dash.count = completed.length;
+    App.dash.avg = completed.length ? Math.round(completed.reduce((s,a) => s + (a.finalScore||100), 0) / completed.length) : null;
+    App.dash.recent = completed.sort((a,b) => new Date(b.startedAt) - new Date(a.startedAt)).slice(0, 5);
+  }
+  if (route === "history") {
+    App.histRaw.audits = await DB.audits();
+    App.hist.audits = App.histRaw.audits;
+    App.hist.total = App.hist.audits.length;
+  }
+  if (route === "tasks" || route === "search") {
+    const vios = await IDB.getAll("audit_violations");
+    const audits = await DB.audits();
+    const cpMap = {};
+    const allChks = await IDB.getAll("checklist_structure");
+    allChks.forEach(c => cpMap[c.id] = c);
+    
+    App.taskRaw = vios.filter(v => v.status !== VIO_STATUS.RESOLVED && v.status !== VIO_STATUS.DISPUTE_UPHELD).map(v => {
+      const a = audits.find(x => x.id === v.auditId) || {};
+      const cp = cpMap[v.checkpointId] || {};
+      return { v, a, object: cp.object || "Нарушение", repeat: 1 };
+    });
+    if (route === "search") App.histRaw.audits = audits;
+  }
+  if (route === "constructor") {
+    if (!App.ctr.deptId && App._departments.length) App.ctr.deptId = App._departments[0].id;
+    if (App.ctr.deptId) {
+      App.ctr.cats = await DB.categories(App.ctr.deptId);
+      App.ctr.checks = await DB.checkpoints(App.ctr.deptId);
+    }
+  }
+};
+
+App.schedOverdue = function(rstId) {
+  const sched = (App._schedules || []).find(s => s.restaurantId === rstId);
+  if (!sched || !sched.everyDays) return null;
+  const last = App._lastAudit[rstId];
+  const dueTs = last ? last + (sched.everyDays * 86400000) : Date.now();
+  return { dueTs, overdue: Date.now() > dueTs };
+};
+
+// 4. Обработка кликов
+App._onClick = async function(e) {
+  const el = e.target.closest("[data-action], [data-route], [data-pin]");
+  if (!el) return;
+  
+  if (el.tagName === 'BUTTON' || el.hasAttribute('data-route') || el.hasAttribute('data-action') || el.hasAttribute('data-pin')) {
+    if (el.tagName !== 'INPUT' && el.tagName !== 'SELECT' && el.tagName !== 'TEXTAREA') {
+      e.preventDefault();
+    }
+  }
+  
+  const action = el.dataset.action;
+  const route = el.dataset.route;
+  const pin = el.dataset.pin;
+
+  if (route) {
+    await App.prepareRouteData(route);
+    App.route(route);
+    return;
+  }
+  if (pin) { Auth.pinPress(pin); return; }
+
+  switch (action) {
+    case "auth-next": Auth.next(); break;
+    case "auth-back": Auth.back(); break;
+    case "theme-toggle": Theme.toggle(); break;
+    case "logout": Session.clear(); location.reload(); break;
+    
+    case "new-audit": await App.prepareRouteData("audit_setup"); App.route("audit_setup"); break;
+    case "set-scope": App.setup.scope = el.dataset.val; App.render(); break;
+    case "sel-dept": App.setup.selDept = el.dataset.dept; App.render(); break;
+    case "start-audit": {
+      const depts = App.setup.scope === "all" ? App.setup.departments.filter(d => d._count > 0).map(d => d.id) : [App.setup.selDept];
+      if (!depts.length) { alert("Нет доступных чек-листов."); return; }
+      Audit.start(App.setup.scope, depts); 
+      break;
+    }
+    case "resume-audit": Audit.resume(el.dataset.id); break;
+    case "switch-dept": Audit.ui.deptId = el.dataset.dept; Audit.ui.openCat = null; App.render(); break;
+    case "toggle-cat": Audit.ui.openCat = Audit.ui.openCat === el.dataset.cat ? null : el.dataset.cat; App.render(); break;
+    case "audit-pause": Audit.pause(); break;
+    case "audit-abort": if (confirm("Прекратить аудит без сохранения?")) Audit.abort(); break;
+    case "audit-finish": Audit.finish(); break;
+
+    case "open-cp": VForm.open(el.dataset.dept, el.dataset.cp); break;
+    case "vform-severity": VForm.draft.severity = el.dataset.val; App.render(); break;
+    case "vform-save": VForm.save(false); break;
+    case "vform-save-add": VForm.save(true); break;
+    case "del-vio": if (confirm("Удалить нарушение?")) Audit.removeViolation(el.dataset.id).then(() => App.render()); break;
+    case "vform-add-photo": document.getElementById('photoInput').click(); break;
+    case "vform-remove-photo": VForm.draft.photos.splice(el.dataset.idx, 1); VForm.draft.markers.splice(el.dataset.idx, 1); App.render(); break;
+    case "vform-edit-photo": PhotoEdit.open(el.dataset.idx); break;
+
+    case "pe-tool": PhotoEdit.tool = el.dataset.val; App.render(); break;
+    case "pe-undo": PhotoEdit.undo(); break;
+    case "pe-cancel": App.route("violation"); break;
+    case "pe-save": PhotoEdit.save(); break;
+
+    case "export-pdf": Reports.exportPDF(); break;
+    case "export-excel": Reports.exportExcel(); break;
+    case "export-csv": Reports.exportAuditCSV(); break;
+    case "export-html": Reports.exportHTML(); break;
+    case "export-tasks-csv": Reports.exportTasksCSV(); break;
+    case "export-tasks-pdf": Reports.exportTasksPDF(); break;
+    case "export-tasks-html": Reports.exportTasksHTML(); break;
+    case "hist-export": Reports.exportPeriod(); break;
+    case "ctr-export": Reports.exportChecklist(App.ctr.deptId, el.dataset.fmt || 'xlsx'); break;
+    case "ctr-import-btn": document.getElementById('checklistInput').click(); break;
+    case "backup-export": if(App.isAdmin()) App.exportBackup(); else alert("Доступ запрещен"); break;
+    case "backup-import": if(App.isAdmin()) document.getElementById('backupInput').click(); else alert("Доступ запрещен"); break;
+
+    case "wf-open": Workflow.open(Audit.active.id, el.dataset.id); break;
+    case "wf-open-ctx": Workflow.open(el.dataset.audit, el.dataset.vio); break;
+    case "task-open": Workflow.open(el.dataset.audit, el.dataset.vio); break;
+    case "wf-fix": Workflow.submitFix(document.getElementById('wfText').value); break;
+    case "wf-resolve": Workflow.resolve(); break;
+    case "wf-reject": Workflow.rejectFix(); break;
+    case "wf-set-score": Workflow.setScore(); break;
+    case "wf-dispute": Workflow.raiseDispute(document.getElementById('wfText').value); break;
+    case "wf-vote-approve": Workflow.voteDispute(true, ""); break;
+    case "wf-vote-reject": Workflow.voteDispute(false, prompt("Причина отклонения:")); break;
+    case "tasks-filter-toggle": App.taskFilterOpen = !App.taskFilterOpen; App.render(); break;
+    case "tasks-reset": App.taskFilter = { restaurant: "", dept: "", assignee: "", status: "", overdue: false }; App.render(); break;
+
+    case "open-history-item": History.openItem(el.dataset.id); break;
+    case "ctr-dept": App.ctr.deptId = el.dataset.id; await App.prepareRouteData("constructor"); App.render(); break;
+    case "open-constructor": await App.prepareRouteData("constructor"); App.route("constructor"); break;
+
+    case "adm-user-new": App.adm.uDraft = { id: "u_" + Date.now(), name: "", login: "", pin: "", roleIds: [], active: true, scope: [], conceptIds: [], deptIds: [] }; App.route("user_edit"); break;
+    case "adm-user-edit": App.adm.uDraft = Object.assign({ scope: [], conceptIds: [], deptIds: [], roleIds: [] }, App.users.find(u => u.id === el.dataset.id)); App.route("user_edit"); break;
+    case "adm-role-new": App.adm.rDraft = { id: "role_" + Date.now(), name: "", permissions: [] }; App.route("role_edit"); break;
+    case "adm-role-edit": App.adm.rDraft = Object.assign({}, App._roles.find(r => r.id === el.dataset.id)); App.route("role_edit"); break;
+    case "concept-add": {
+      const cName = prompt("Название концепции:"); 
+      if(cName) { await DB.saveConcept({id:"c_"+Date.now(), name:cName}); await App.reloadState(); App.render(); } 
+      break;
+    }
+    case "dept-add": {
+      const dName = prompt("Название подразделения:"); 
+      if(dName) { await DB.saveDept({id:"dept_"+Date.now(), name:dName, order:App._departments.length+1}); await App.reloadState(); App.render(); } 
+      break;
+    }
+    case "geo-add": {
+      const gName = prompt("Название:"); 
+      if(gName) { await DB.saveGeo({id:"g_"+Date.now(), name:gName, type:el.dataset.type, parentId:el.dataset.parent}); await App.reloadState(); App.render(); } 
+      break;
+    }
+    case "pos-new": App.adm.posDraft = { id: "pos_" + Date.now(), title: "", parentId: el.dataset.parent, roleIds: [] }; App.route("position_edit"); break;
+    case "pos-edit": App.adm.posDraft = Object.assign({ roleIds: [] }, App._positions.find(p => p.id === el.dataset.id)); App.route("position_edit"); break;
+    case "pol-list": App.route("policies"); break;
+    case "pol-edit": App.adm.pDraft = Object.assign({id: el.dataset.id, mode: "threshold", threshold: 60, approvers: []}, App._policies.find(p => p.id === el.dataset.id)); App.route("policy_edit"); break;
+    case "pol-mode": App.adm.pDraft.mode = el.dataset.val; App.render(); break;
+    case "open-journal": App.route("journal"); break;
+
+    case "ctr-cat-new": App.ctr.catDraft = { id: "cat_" + Date.now(), deptId: App.ctr.deptId, name: "", weight: 0 }; App.route("category_edit"); break;
+    case "ctr-cat-edit": App.ctr.catDraft = Object.assign({}, App.ctr.cats.find(c => c.id === el.dataset.id)); App.route("category_edit"); break;
+    case "ctr-cp-new": App.ctr.cpDraft = { id: "chk_" + Date.now(), deptId: App.ctr.deptId, categoryId: el.dataset.cat, index: "", object: "", criterion: "", requirement: "", severityMode: "range" }; App.route("checkpoint_edit"); break;
+    case "ctr-cp-edit": App.ctr.cpDraft = Object.assign({}, App.ctr.checks.find(c => c.id === el.dataset.id)); App.route("checkpoint_edit"); break;
+    case "cp-mode": App.ctr.cpDraft.severityMode = el.dataset.val; App.render(); break;
+    case "ctr-cat-save": await DB.saveCategory(App.ctr.catDraft); await App.prepareRouteData("constructor"); App.route("constructor"); break;
+    case "ctr-cp-save": await DB.saveCheckpoint(App.ctr.cpDraft); await App.prepareRouteData("constructor"); App.route("constructor"); break;
+
+    case "adm-user-save": await DB.saveUser(App.adm.uDraft); await App.reloadState(); App.route(App.adm._staffMode ? "staff" : "settings"); break;
+    case "adm-role-save": await DB.saveRole(App.adm.rDraft); await App.reloadState(); App.route("settings"); break;
+    case "pos-save": await DB.savePosition(App.adm.posDraft); await App.reloadState(); App.route("positions"); break;
+    case "pol-save": await DB.savePolicy(App.adm.pDraft); await App.reloadState(); App.route("policies"); break;
+    
+    case "concept-del": if(confirm("Удалить концепцию?")) { await DB.delConcept(el.dataset.id); await App.reloadState(); App.render(); } break;
+    case "dept-del": if(confirm("Удалить подразделение?")) { await DB.delDept(el.dataset.id); await App.reloadState(); App.render(); } break;
+    case "geo-del": if(confirm("Удалить локацию?")) { await DB.delGeo(el.dataset.id); await App.reloadState(); App.render(); } break;
+    case "pos-del": if(confirm("Удалить должность?")) { await DB.delPosition(el.dataset.id); await App.reloadState(); App.route("positions"); } break;
+    case "adm-user-del": if(confirm("Удалить пользователя?")) { await DB.delUser(el.dataset.id); await App.reloadState(); App.route("settings"); } break;
+    case "adm-role-del": if(confirm("Удалить роль?")) { await DB.delRole(el.dataset.id); await App.reloadState(); App.route("settings"); } break;
+    case "ctr-cat-del": if(confirm("Удалить категорию со всеми пунктами?")) {
+      const id = el.dataset.id;
+      const cps = App.ctr.checks.filter(x => x.categoryId === id);
+      await Promise.all([DB.delCategory(id), ...cps.map(cp => DB.delCheckpoint(cp.id))]);
+      await App.prepareRouteData("constructor");
+      App.render();
+    } break;
+    case "ctr-cp-del": if(confirm("Удалить пункт?")) {
+      await DB.delCheckpoint(el.dataset.id);
+      await App.prepareRouteData("constructor");
+      App.render();
+    } break;
+  }
+};
+
+// 5. Обработка изменений форм
+App._onChange = function(e) {
+  const el = e.target;
+  
+  if (el.id === "backupInput" && el.files.length) App.importBackup(el.files[0]);
+  if (el.id === "checklistInput" && el.files.length) App.importChecklist(el.files[0]);
+  if (el.id === "photoInput" && el.files.length) {
+    Promise.all(Array.from(el.files).map(f => Media.compress(f))).then(res => {
+      VForm.draft.photos.push(...res); App.render();
+    });
+    el.value = "";
+  }
+
+  const field = el.dataset.field;
+  if (!field) return;
+  
+  switch (field) {
+    case "auth-login": Auth.loginVal = el.value; break;
+    case "setup-restaurant": App.setup.restaurantId = el.value; break;
+    case "penalty": VForm.setPenalty(el.value); break;
+    case "assignee": VForm.draft.assigneeRole = el.value; break;
+    case "vdeadline": VForm.draft.deadline = el.value; break;
+    case "comment": VForm.draft.comment = el.value; break;
+    case "hf-from": App.histFilter.from = el.value; App.render(); break;
+    case "hf-to": App.histFilter.to = el.value; App.render(); break;
+    case "tf-restaurant": App.taskFilter.restaurant = el.value; App.render(); break;
+    case "tf-dept": App.taskFilter.dept = el.value; App.render(); break;
+    case "tf-assignee": App.taskFilter.assignee = el.value; App.render(); break;
+    case "tf-status": App.taskFilter.status = el.value; App.render(); break;
+    case "tf-overdue": App.taskFilter.overdue = el.checked; App.render(); break;
+    
+    case "u-positionId": App.adm.uDraft.positionId = el.value; break;
+    case "u-active": App.adm.uDraft.active = el.checked; break;
+    case "u-role": {
+      const roles = new Set(App.adm.uDraft.roleIds || []);
+      if (el.checked) roles.add(el.value); else roles.delete(el.value);
+      App.adm.uDraft.roleIds = Array.from(roles);
+      break;
+    }
+    case "u-concept": {
+      const concepts = new Set(App.adm.uDraft.conceptIds || []);
+      if (el.checked) concepts.add(el.value); else concepts.delete(el.value);
+      App.adm.uDraft.conceptIds = Array.from(concepts);
+      break;
+    }
+    case "u-scope": {
+      const scope = new Set(App.adm.uDraft.scope || []);
+      if (el.checked) scope.add(el.value); else scope.delete(el.value);
+      App.adm.uDraft.scope = Array.from(scope);
+      break;
+    }
+    case "u-dept": {
+      const depts = new Set(App.adm.uDraft.deptIds || []);
+      if (el.checked) depts.add(el.value); else depts.delete(el.value);
+      App.adm.uDraft.deptIds = Array.from(depts);
+      break;
+    }
+    case "r-perm": {
+      const perms = new Set(App.adm.rDraft.permissions || []);
+      if (el.checked) perms.add(el.value); else perms.delete(el.value);
+      App.adm.rDraft.permissions = Array.from(perms);
+      break;
+    }
+    case "pos-role": {
+      const roles = new Set(App.adm.posDraft.roleIds || []);
+      if (el.checked) roles.add(el.value); else roles.delete(el.value);
+      App.adm.posDraft.roleIds = Array.from(roles);
+      break;
+    }
+    case "pol-threshold": App.adm.pDraft.threshold = Number(el.value); App.render(); break;
+    case "pol-approver": {
+      const uid = el.value;
+      let approvers = App.adm.pDraft.approvers || [];
+      if (el.checked) {
+        if (!approvers.some(a => a.userId === uid)) approvers.push({ userId: uid, weight: 1, canOverride: false });
+      } else {
+        approvers = approvers.filter(a => a.userId !== uid);
+      }
+      App.adm.pDraft.approvers = approvers;
+      App.render();
+      break;
+    }
+    case "pol-override": {
+      const uid = el.dataset.uid;
+      const app = (App.adm.pDraft.approvers || []).find(a => a.userId === uid);
+      if (app) app.canOverride = el.checked;
+      break;
+    }
+    case "rest-concept": {
+      const node = App._geo.find(n => n.id === el.dataset.id);
+      if (node) { node.conceptId = el.value; DB.saveGeo(node); }
+      break;
+    }
+  }
+};
+
+// 6. Обработка текстового ввода
+App._onInput = function(e) {
+  const el = e.target;
+  const field = el.dataset.field;
+  if (!field) return;
+
+  if (field === "auth-login") Auth.loginVal = el.value;
+  if (field === "search-q") {
+    App.searchQuery = el.value;
+    const q = el.value.toLowerCase();
+    if (q.length >= 2) {
+      App._search.audits = (App.histRaw.audits || []).filter(a => (a.restaurant||"").toLowerCase().includes(q) || (a.auditorName||"").toLowerCase().includes(q));
+      App._search.violations = (App.taskRaw || []).filter(t => (t.object||"").toLowerCase().includes(q) || (t.v.comment||"").toLowerCase().includes(q));
+      App._search.users = (App.users || []).filter(u => (u.name||"").toLowerCase().includes(q) || (u.login||"").toLowerCase().includes(q));
+      App._search.places = (App._geo || []).filter(n => (n.name||"").toLowerCase().includes(q));
+      App._search.depts = (App._departments || []).filter(d => (d.name||"").toLowerCase().includes(q));
+    }
+    const container = App.el.querySelector("main");
+    if (container && Session.data.route === "search") {
+      const subScreen = App.screens.search();
+      const temp = document.createElement("div");
+      temp.innerHTML = subScreen;
+      const newMain = temp.querySelector("main");
+      if (newMain) container.innerHTML = newMain.innerHTML;
+    }
+  }
+  if (field === "user-search") { App.adm.userQuery = el.value; App.render(); }
+  if (field === "cat-name") App.ctr.catDraft.name = el.value;
+  if (field === "cat-weight") { App.ctr.catDraft.weight = Number(el.value); App.render(); }
+  if (field === "cp-index") App.ctr.cpDraft.index = el.value;
+  if (field === "cp-object") App.ctr.cpDraft.object = el.value;
+  if (field === "cp-criterion") App.ctr.cpDraft.criterion = el.value;
+  if (field === "cp-req") App.ctr.cpDraft.requirement = el.value;
+  if (field === "cp-fixed") { App.ctr.cpDraft.fixedPenalty = Number(el.value); App.render(); }
+  if (field === "u-name") App.adm.uDraft.name = el.value;
+  if (field === "u-login") App.adm.uDraft.login = el.value;
+  if (field === "u-position") App.adm.uDraft.position = el.value;
+  if (field === "u-pin") App.adm.uDraft.pin = el.value;
+  if (field === "r-name") App.adm.rDraft.name = el.value;
+  if (field === "pos-title") App.adm.posDraft.title = el.value;
+  if (field === "pol-weight") {
+    const uid = el.dataset.uid;
+    const app = (App.adm.pDraft.approvers || []).find(a => a.userId === uid);
+    if (app) app.weight = Number(el.value) || 1;
+  }
+  if (field === "sched-days") {
+    const rstId = el.dataset.id;
+    const days = Number(el.value) || 0;
+    DB.saveSchedule({ id: "sch_" + rstId, restaurantId: rstId, everyDays: days }).then(() => App.reloadState());
+  }
+};
+
+// 7. Импорт чек-листов Excel
+App.importChecklist = async function(file) {
+  if (!window.XLSX) { alert("Библиотека Excel не загружена (нужен интернет)."); return; }
+  if (!App.ctr.deptId) { alert("Выберите подразделение для импорта."); return; }
+  
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    try {
+      const data = new Uint8Array(e.target.result);
+      const wb = window.XLSX.read(data, { type: 'array' });
+      
+      let cats = [], checks = [];
+      const deptId = App.ctr.deptId;
+
+      if (wb.SheetNames.includes("Категории") && wb.SheetNames.includes("Пункты")) {
+        const catSheet = window.XLSX.utils.sheet_to_json(wb.Sheets["Категории"]);
+        const cpSheet = window.XLSX.utils.sheet_to_json(wb.Sheets["Пункты"]);
+        
+        const catMap = {};
+        catSheet.forEach((row, i) => {
+          const cat = { id: "cat_" + Date.now() + "_" + i, deptId, name: row["Категория"], weight: Number(row["Вес %"]) || 0 };
+          cats.push(cat);
+          catMap[row["Категория"]] = cat.id;
+        });
+
+        cpSheet.forEach((row, i) => {
+          const categoryId = catMap[row["Категория"]] || (cats[0] ? cats[0].id : null);
+          if (categoryId) {
+            checks.push({
+              id: "chk_" + Date.now() + "_" + i, deptId, categoryId,
+              index: String(row["Индекс"] || ""), object: String(row["Объект"] || ""),
+              criterion: String(row["Критерий"] || ""), requirement: String(row["Требование"] || ""),
+              severityMode: SEVMODE.RANGE
+            });
+          }
+        });
+      } else {
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rawData = window.XLSX.utils.sheet_to_json(sheet);
+        
+        rawData.forEach((row, i) => {
+          let cat = cats.find(c => c.name === row["Категория"]);
+          if (!cat) {
+            cat = { id: "cat_" + Date.now() + "_" + i, deptId, name: row["Категория"] || "Общее", weight: Number(row["Вес %"]) || 0 };
+            cats.push(cat);
+          }
+          checks.push({
+            id: "chk_" + Date.now() + "_" + i, deptId, categoryId: cat.id,
+            index: String(row["Индекс"] || ""), object: String(row["Объект"] || ""),
+            criterion: String(row["Критерий"] || ""), requirement: String(row["Требование"] || ""),
+            severityMode: SEVMODE.RANGE
+          });
+        });
+      }
+      
+      await IDB.bulkPut("checklist_categories", cats);
+      await IDB.bulkPut("checklist_structure", checks);
+      alert("Чек-лист успешно импортирован!");
+      await App.reloadState();
+      await App.prepareRouteData("constructor");
+      App.render();
+    } catch (err) { 
+      console.error(err);
+      alert("Ошибка импорта файла. Проверьте формат полей Excel."); 
+    }
+  };
+  reader.readAsArrayBuffer(file);
+};
+
+// 8. Экспорт задач в HTML
+Reports.exportTasksHTML = async function() {
+  const list = App.filteredTasks();
+  const roleTitle = (id) => (App._orgRoles.find(r => r.id === id) || {}).title || "";
+  const st = { open: "Открыто", fix_submitted: "На проверке", dispute_rejected: "Оспаривание отклонено" };
+  const m = {
+    auditor: App.user.name, date: App.fmtDate(new Date().toISOString()), restaurant: "Все", scope: "Реестр задач", finalScore: 100,
+    depts: [], violations: list.map(t => ({
+      deptName: App.deptName(t.v.deptId), index: "", object: t.object, criterion: st[t.v.status] || t.v.status,
+      severity: t.v.severity, penalty: t.v.penaltyPercent, comment: (t.a.restaurant || "") + (t.v.comment ? " | " + t.v.comment : ""),
+      assignee: roleTitle(t.v.assigneeRole), time: t.v.deadline || "бессрочно", photos: t.v.photos || []
+    })),
+    critical: [], nonCritical: []
+  };
+  m.critical = m.violations.filter(v => v.severity === SEVERITY.CRITICAL);
+  m.nonCritical = m.violations.filter(v => v.severity !== SEVERITY.CRITICAL);
+  return Reports.exportHTML(m);
+};
+
+/* ===================== END OF PATCH ===================== */
 
 /* ===================== Boot ===================== */
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", App.boot);
