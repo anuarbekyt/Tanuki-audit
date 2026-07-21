@@ -54,7 +54,7 @@ const APP_CONFIG = {
   version: "0.1.0",
   // Google Apps Script Web App URL — filled after backend deploy (Step 2)
   apiUrl: "https://script.google.com/macros/s/AKfycbw9tNUWHSVbHVNXyDdSJ6hN74HlbabeJDSyMmPL-88lcn_46aPPXEbKvODgs7fNxw/exec",
-  db: { name: "tanuki_audit", version: 8 }
+  db: { name: "tanuki_audit", version: 9 }
 };
 
 /* ---------- IndexedDB schema: stores, keyPath, indexes ---------- */
@@ -819,6 +819,27 @@ const Sync = {
       const j = await r.json(); return !!j.ok;
     } catch (e) { return false; }
   },
+  async pull() {
+    if (!APP_CONFIG.apiUrl || !navigator.onLine || !IDB._db) return;
+    try {
+      const r = await fetch(APP_CONFIG.apiUrl + "?action=bootstrap", { method: "GET" });
+      const j = await r.json();
+      if (j.ok) {
+        const configStores = [
+          "users_roles", "roles", "geo_nodes", "positions", "departments",
+          "checklist_categories", "checklist_structure", "penalties", "orgRoles",
+          "concepts", "dispute_policies", "audit_log"
+        ];
+        for (const store of configStores) {
+          if (j[store] && Array.isArray(j[store])) {
+            const os = IDB._db.transaction(store, "readwrite").objectStore(store);
+            await new Promise(res => { const req = os.clear(); req.onsuccess = res; req.onerror = res; });
+            await IDB.bulkPut(store, j[store]);
+          }
+        }
+      }
+    } catch (e) { console.warn("Pull failed", e); }
+  },
   async pushAudit(audit, violations) {
     if (!APP_CONFIG.apiUrl) throw new Error("apiUrl not set");
     const res = await fetch(APP_CONFIG.apiUrl, {
@@ -836,7 +857,7 @@ const Sync = {
   },
   async dequeue(auditId) { try { await IDB.del("syncQueue", "q_" + auditId); } catch (e) {} },
   async flush() {
-    if (Sync._flushing || !APP_CONFIG.apiUrl || !navigator.onLine) return;
+    if (Sync._flushing || !APP_CONFIG.apiUrl || !navigator.onLine || !IDB._db) return;
     Sync._flushing = true;
     let progressed = false;
     try {
@@ -848,8 +869,24 @@ const Sync = {
           const vios = await DB.violations(item.auditId);
           const res = await Sync.pushAudit(audit, vios);
           if (res && res.ok) { await IDB.del("syncQueue", item.qid); progressed = true; }
-          else break; // server error -> keep queue, retry on next trigger
-        } catch (e) { break; } // network error -> keep queue, retry on next trigger
+          else break;
+        } catch (e) { break; }
+      }
+      // Sync other tables (admin changes)
+      if (App.isAdmin()) {
+        const logs = await IDB.getAll("audit_log");
+        await fetch(APP_CONFIG.apiUrl, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify({ type: "admin_sync",
+            users: await IDB.getAll("users_roles"),
+            roles: await IDB.getAll("roles"),
+            geo: await IDB.getAll("geo_nodes"),
+            concepts: await IDB.getAll("concepts"),
+            depts: await IDB.getAll("departments"),
+            logs: logs
+          })
+        });
       }
     } finally {
       Sync._flushing = false;
@@ -939,6 +976,7 @@ const Audit = {
     Audit.data.violations = [];
     Audit.ui = { deptId: deptIds[0], openCat: null };
     await DB.saveAudit(Audit.active);
+    Session.set({ activeAuditId: Audit.active.id });
     App.route("audit_run");
   },
 
@@ -958,6 +996,7 @@ const Audit = {
     Audit.data.violations = await DB.violations(id);
     Audit.ui = { deptId: a.deptIds[0], openCat: null };
     if (a.status === AUDIT_STATUS.PAUSED) { a.status = AUDIT_STATUS.IN_PROGRESS; await DB.saveAudit(a); }
+    Session.set({ activeAuditId: id });
     App.route("audit_run");
   },
 
@@ -1005,9 +1044,9 @@ const Audit = {
     await Audit.persist();
   },
 
-  async pause()  { Audit.active.status = AUDIT_STATUS.PAUSED; await Audit.persist(); Audit.active = null; App.route("home"); },
-  async finish() { const a = Audit.active; a.status = AUDIT_STATUS.COMPLETED; a.finishedAt = new Date().toISOString(); await Audit.persist(); Sync.enqueue(a.id); App.route("audit_done"); },
-  async abort()  { const a = Audit.active; a.status = AUDIT_STATUS.ABORTED; a.finishedAt = new Date().toISOString(); await Audit.persist(); Sync.enqueue(a.id); Audit.active = null; App.route("home"); }
+  async pause()  { Audit.active.status = AUDIT_STATUS.PAUSED; await Audit.persist(); Session.set({ activeAuditId: null }); Audit.active = null; App.route("home"); },
+  async finish() { const a = Audit.active; a.status = AUDIT_STATUS.COMPLETED; a.finishedAt = new Date().toISOString(); await Audit.persist(); Sync.enqueue(a.id); Session.set({ activeAuditId: null }); App.route("audit_done"); },
+  async abort()  { const a = Audit.active; a.status = AUDIT_STATUS.ABORTED; a.finishedAt = new Date().toISOString(); await Audit.persist(); Sync.enqueue(a.id); Session.set({ activeAuditId: null }); Audit.active = null; App.route("home"); }
 };
 
 /* ===================== Reports (PDF / Excel / HTML) ===================== */
@@ -1316,6 +1355,7 @@ const VForm = {
     VForm.penalties = await DB.penalties();
     VForm.orgRoles = await DB.orgRoles();
     VForm.newDraft(deptId, checkpointId);
+    Session.set({ activeVioId: checkpointId });
     App.route("violation");
   },
   newDraft(deptId, checkpointId) {
@@ -1339,6 +1379,7 @@ const VForm = {
     const d = VForm.draft;
     d.thread = d.comment ? [{ author: THREAD_AUTHOR.AUDITOR, name: App.user.name, text: d.comment, ts: d.createdAt }] : [];
     await Audit.addViolation(Object.assign({}, d, { photos: d.photos.slice(), markers: d.markers.slice() }));
+    Session.set({ activeVioId: null });
     if (addAnother) { VForm.newDraft(d.deptId, d.checkpointId); App.render(); }
     else App.route("audit_run");
   }
@@ -1580,13 +1621,53 @@ const Workflow = {
 const App = {
   user: null,
   users: [],
+  setup: { scope: "single", restaurants: [], departments: [], selDept: null, resumable: [] },
+  taskFilter: { restaurant: "", dept: "", assignee: "", status: "", overdue: false },
+  taskFilterOpen: false,
+  taskRaw: [],
+  histFilter: { from: "", to: "", auditorId: "", restaurantId: "", deptId: "", assignee: "" },
+  histFilterOpen: false,
+  histRaw: { audits: [], vios: [], cpMap: {} },
+  hist: { audits: [], total: 0, avg: null, trend: [], top: [] },
+  dash: { avg: null, count: 0, voteQueue: [], resolveQueue: [], attention: [], recent: [] },
+  adm: { userQuery: "", staffQuery: "", posDraft: null, uDraft: null, rDraft: null, pDraft: null, _staffMode: false },
+  ctr: { cats: [], checks: [], deptId: null, catDraft: null, cpDraft: null, _versions: [] },
+  shr: { granted: [] },
+  _search: { audits: [], violations: [], users: [], places: [], depts: [] },
+  searchQuery: "",
+  _schedules: [],
+  _lastAudit: {},
+  _journal: [],
 
+  _splash(text) {
+    return `<div class="min-h-dvh flex flex-col items-center justify-center p-6 text-center">
+      ${UI.logo("h-12 mb-6")}
+      <div class="flex items-center gap-3 text-slate-500 dark:text-slate-400">
+        <svg class="w-5 h-5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-opacity="0.2"/><path d="M12 2a10 10 0 0 1 10 10"/></svg>
+        <span class="text-sm font-medium">${text}</span>
+      </div>
+    </div>`;
+  },
+
+  // ... (previous logic here) ...
   async boot() {
     Session.load(); Theme.apply();
     App.el = document.getElementById("app");
+    if (!App.el) return;
     App.el.innerHTML = App._splash("Загрузка…");
     try {
       await DB.init();
+      App.el.innerHTML = App._splash("Синхронизация с сервером…");
+      
+      if (navigator.onLine) {
+        try {
+          await Sync.flush();
+          await Sync.pull();
+        } catch (syncErr) {
+          console.warn("Синхронизация недоступна, работаем офлайн");
+        }
+      }
+
       App.users = await DB.users();
       App._roles = await DB.roles();
       App._geo = await DB.geoNodes();
@@ -1596,16 +1677,173 @@ const App = {
       App._access = await DB.access();
       App._concepts = await DB.concepts();
       App._departments = await DB.departments();
-      App._catCount = {}; (await IDB.getAll("checklist_categories")).forEach(c => App._catCount[c.deptId] = (App._catCount[c.deptId] || 0) + 1);
+      
+      App._catCount = {}; 
+      (await IDB.getAll("checklist_categories")).forEach(c => App._catCount[c.deptId] = (App._catCount[c.deptId] || 0) + 1);
+
       if (Session.data.userId) App.user = App.users.find(u => u.id === Session.data.userId) || null;
-      if (App.user) { await App.refreshNotif(); App.autoBackupCheck(); }
-      App.route(App.user ? (Session.data.route === "login" ? "home" : Session.data.route) : "login");
+
+      if (App.user) {
+        await App.refreshNotif(); 
+
+        const allAudits = await DB.audits();
+        const savedActiveId = Session.data.activeAuditId;
+        const currentRoute = Session.data.route;
+
+        let activeAuditToResume = null;
+
+        if (savedActiveId) {
+          activeAuditToResume = allAudits.find(a => a.id === savedActiveId && (a.status === AUDIT_STATUS.IN_PROGRESS || a.status === AUDIT_STATUS.PAUSED));
+        }
+
+        if (!activeAuditToResume && (currentRoute === "audit_run" || currentRoute === "violation")) {
+          activeAuditToResume = allAudits.find(a => a.status === AUDIT_STATUS.IN_PROGRESS);
+        }
+
+        for (const a of allAudits) {
+          if (a.status === AUDIT_STATUS.IN_PROGRESS && (!activeAuditToResume || a.id !== activeAuditToResume.id)) {
+            a.status = AUDIT_STATUS.PAUSED;
+            await DB.saveAudit(a);
+            Sync.enqueue(a.id);
+          }
+        }
+
+        if (activeAuditToResume && (currentRoute === "audit_run" || currentRoute === "violation")) {
+          await Audit.resume(activeAuditToResume.id);
+          if (currentRoute === "violation" && Session.data.activeVioId) {
+            Workflow.open(activeAuditToResume.id, Session.data.activeVioId);
+          }
+        }
+      }
+
+      const routeTo = App.user ? (Session.data.route === "login" ? "home" : Session.data.route) : "login";
+      await App.prepareRouteData(routeTo);
+      App.route(routeTo);
     } catch (e) {
-      App.el.innerHTML = App._splash("Ошибка инициализации: " + e.message);
+      console.error("Boot error:", e);
+      if (App.el) App.el.innerHTML = App._splash("Ошибка инициализации: " + e.message);
     }
+
     document.addEventListener("click", App._onClick);
     document.addEventListener("change", App._onChange);
     document.addEventListener("input", App._onInput);
+  },
+
+// ... rest of the code remains unchanged ...
+
+  async _onClick(e) {
+    const el = e.target.closest("[data-action], [data-route], [data-pin]");
+    if (!el) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const action = el.dataset.action;
+    const route = el.dataset.route;
+    const pin = el.dataset.pin;
+
+    if (route) { await App.prepareRouteData(route); App.route(route); return; }
+    if (pin) { Auth.pinPress(pin); return; }
+
+    switch (action) {
+      case "auth-next": Auth.next(); break;
+      case "auth-back": Auth.back(); break;
+      case "theme-toggle": Theme.toggle(); break;
+      case "logout": Session.clear(); location.reload(); break;
+      
+      // Аудит
+      case "new-audit": App.route("audit_setup"); break;
+      case "set-scope": App.setup.scope = el.dataset.val; App.render(); break;
+      case "sel-dept": App.setup.selDept = el.dataset.dept; App.render(); break;
+      case "start-audit": 
+        const depts = App.setup.scope === "all" ? App.setup.departments.filter(d => d._count > 0).map(d => d.id) : [App.setup.selDept];
+        if (!depts.length) { alert("Нет доступных чек-листов."); return; }
+        Audit.start(App.setup.scope, depts); 
+        break;
+      case "resume-audit": Audit.resume(el.dataset.id); break;
+      case "switch-dept": Audit.ui.deptId = el.dataset.dept; Audit.ui.openCat = null; App.render(); break;
+      case "toggle-cat": Audit.ui.openCat = Audit.ui.openCat === el.dataset.cat ? null : el.dataset.cat; App.render(); break;
+      case "audit-pause": Audit.pause(); break;
+      case "audit-abort": if (confirm("Прекратить аудит без сохранения?")) Audit.abort(); break;
+      case "audit-finish": Audit.finish(); break;
+
+      // Нарушения
+      case "open-cp": VForm.open(el.dataset.dept, el.dataset.cp); break;
+      case "vform-severity": VForm.draft.severity = el.dataset.val; App.render(); break;
+      case "vform-save": VForm.save(false); break;
+      case "vform-save-add": VForm.save(true); break;
+      case "del-vio": if (confirm("Удалить нарушение?")) Audit.removeViolation(el.dataset.id).then(() => App.render()); break;
+      case "vform-add-photo": document.getElementById('photoInput').click(); break;
+      case "vform-remove-photo": VForm.draft.photos.splice(el.dataset.idx, 1); VForm.draft.markers.splice(el.dataset.idx, 1); App.render(); break;
+      case "vform-edit-photo": PhotoEdit.open(el.dataset.idx); break;
+
+      // Фото-редактор
+      case "pe-tool": PhotoEdit.tool = el.dataset.val; App.render(); break;
+      case "pe-undo": PhotoEdit.undo(); break;
+      case "pe-cancel": App.route("violation"); break;
+      case "pe-save": PhotoEdit.save(); break;
+
+      // Экспорт, Импорт и Бэкапы
+      case "export-pdf": Reports.exportPDF(); break;
+      case "export-excel": Reports.exportExcel(); break;
+      case "export-csv": Reports.exportAuditCSV(); break;
+      case "export-html": Reports.exportHTML(); break;
+      case "export-tasks-csv": Reports.exportTasksCSV(); break;
+      case "hist-export": Reports.exportPeriod(); break;
+      case "ctr-export": Reports.exportChecklist(App.ctr.deptId); break;
+      case "ctr-import-btn": document.getElementById('checklistInput').click(); break;
+      case "backup-export": if(App.isAdmin()) App.exportBackup(); else alert("Доступ запрещен"); break;
+      case "backup-import": if(App.isAdmin()) document.getElementById('backupInput').click(); else alert("Доступ запрещен"); break;
+
+      // Workflow / Оспаривания
+      case "wf-open": Workflow.open(Audit.active.id, el.dataset.id); break;
+      case "wf-open-ctx": Workflow.open(el.dataset.audit, el.dataset.vio); break;
+      case "task-open": Workflow.open(el.dataset.audit, el.dataset.vio); break;
+      case "wf-fix": Workflow.submitFix(document.getElementById('wfText').value); break;
+      case "wf-resolve": Workflow.resolve(); break;
+      case "wf-reject": Workflow.rejectFix(); break;
+      case "wf-set-score": Workflow.setScore(); break;
+      case "wf-dispute": Workflow.raiseDispute(document.getElementById('wfText').value); break;
+      case "wf-vote-approve": Workflow.voteDispute(true, ""); break;
+      case "wf-vote-reject": Workflow.voteDispute(false, prompt("Причина отклонения:")); break;
+
+      // История и Конструктор
+      case "open-history-item": History.openItem(el.dataset.id); break;
+      case "ctr-dept": App.ctr.deptId = el.dataset.id; await App.prepareRouteData("constructor"); App.render(); break;
+    }
+  },
+
+  _onChange(e) {
+    const el = e.target;
+    
+    // Обработчики загрузки файлов
+    if (el.id === "backupInput" && el.files.length) App.importBackup(el.files[0]);
+    if (el.id === "checklistInput" && el.files.length) App.importChecklist(el.files[0]);
+    if (el.id === "photoInput" && el.files.length) {
+      Promise.all(Array.from(el.files).map(f => Media.compress(f))).then(res => {
+        VForm.draft.photos.push(...res); App.render();
+      });
+      el.value = "";
+    }
+
+    const field = el.dataset.field;
+    if (!field) return;
+    
+    switch (field) {
+      case "auth-login": Auth.loginVal = el.value; break;
+      case "setup-restaurant": App.setup.restaurantId = el.value; break;
+      case "penalty": VForm.setPenalty(el.value); break;
+      case "assignee": VForm.draft.assigneeRole = el.value; break;
+      case "vdeadline": VForm.draft.deadline = el.value; break;
+      case "comment": VForm.draft.comment = el.value; break;
+      case "hf-from": App.histFilter.from = el.value; App.render(); break;
+      case "hf-to": App.histFilter.to = el.value; App.render(); break;
+    }
+  },
+
+  _onInput(e) {
+    const el = e.target;
+    const field = el.dataset.field;
+    if (!field) return;
+    if (field === "auth-login") Auth.loginVal = el.value;
     document.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && Session.data.route === "login" && Auth.step === "login") Auth.next();
     });
@@ -1614,959 +1852,200 @@ const App = {
     Sync.flush();
   },
 
-  route(name) { if (Voice.active && name !== "violation") Voice.stop(); Session.set({ route: name }); App.render(); },
+  route(name) {
+    Session.set({ route: name });
+    App.render();
+  },
+
   render() {
-    const r = Session.data.route;
-    const screen = App.screens[r] || App.screens.home;
+    if (!App.el) return;
+    const screen = App.screens[Session.data.route] || App.screens.home;
     App.el.innerHTML = screen();
-    if (App._after) { const f = App._after; App._after = null; f(); }
-    Theme.apply();
-    App._refreshSync();
+    if (App._after) { App._after(); App._after = null; }
+    window.scrollTo(0, 0);
   },
 
-  _syncOk: null,
-  _syncLast: 0,
-  async _refreshSync(force) {
-    const now = Date.now();
-    if (!force && now - App._syncLast < 10000) return;
-    App._syncLast = now;
-    const ok = await Sync.ping();
-    App._setSync(ok);
+  appBar(title, opts) {
+    const back = opts && opts.back ? `<button data-route="${opts.back}" class="w-10 h-10 grid place-items-center -ml-2">${UI.icon("back", "w-6 h-6")}</button>` : "";
+    const notif = App.user ? `<button data-route="notifications" class="relative w-10 h-10 grid place-items-center">${UI.icon("bell", "w-6 h-6")}${App._notifCount ? `<span class="absolute top-2 right-2 w-2 h-2 bg-brand rounded-full"></span>` : ""}</button>` : "";
+    return `<header class="sticky top-0 z-30 h-14 bg-white/80 dark:bg-slate-900/80 backdrop-blur border-b border-slate-200 dark:border-slate-800 px-4 flex items-center justify-between">
+      <div class="flex items-center gap-1">${back}<h1 class="font-bold text-lg truncate">${title}</h1></div>
+      <div class="flex items-center gap-1">${notif}<button data-action="theme-toggle" class="w-10 h-10 grid place-items-center">${UI.icon(Session.data.theme === "dark" ? "sun" : "moon", "w-5 h-5")}</button></div>
+    </header>`;
   },
 
-  setup: { departments: [], resumable: [], scope: "single", selDept: null },
-
-  _onClick(e) {
-    const t = e.target.closest("[data-action],[data-route],[data-pin]");
-    if (!t) return;
-    const d = t.dataset;
-    if (d.pin != null) { Auth.pinPress(d.pin); return; }
-    const a = d.action;
-    switch (a) {
-      case "theme":  Theme.toggle(); return;
-      case "logout": Session.clear(); App.user = null; Auth.reset(); App.route("login"); return;
-      case "auth-next": Auth.next(); return;
-      case "auth-back": Auth.back(); return;
-      case "new-audit": App.openAuditSetup(); return;
-      case "set-scope": App.setup.scope = d.val; App.render(); return;
-      case "sel-dept": App.setup.selDept = d.dept; App.render(); return;
-      case "start-audit": App.doStartAudit(); return;
-      case "resume-audit": Audit.resume(d.id); return;
-      case "switch-dept": Audit.ui.deptId = d.dept; Audit.ui.openCat = null; App.render(); return;
-      case "toggle-cat": Audit.ui.openCat = (Audit.ui.openCat === d.cat ? null : d.cat); App.render(); return;
-      case "open-cp": VForm.open(d.dept, d.cp); return;
-      case "del-vio": if (confirm("Удалить это нарушение?")) Audit.removeViolation(d.id).then(() => App.render()); return;
-      case "audit-pause": Audit.pause(); return;
-      case "audit-finish": if (confirm("Завершить аудит и сформировать результат?")) Audit.finish(); return;
-      case "audit-abort": if (confirm("Прекратить аудит? Он будет помечен как отменённый.")) Audit.abort(); return;
-      case "export-pdf":   Reports.exportPDF(); return;
-      case "export-excel": Reports.exportExcel(); return;
-      case "export-html":  Reports.exportHTML(); return;
-      case "export-csv":   Reports.exportAuditCSV(); return;
-      case "export-tasks-csv": Reports.exportTasksCSV(); return;
-      case "share-open": App.openShare(d.id); return;
-      case "share-save": App.saveShare(); return;
-      case "ack-request": App.ackRequest(App.ackPick); return;
-      case "ack-delegate": App.ackDelegate(App.ackPick); return;
-      case "ack-confirm": App.ackConfirm(); return;
-      case "history": App.openHistory(); return;
-      case "dashboard": App.openDashboard(); return;
-      case "tasks": App.openTasks(); return;
-      case "search": App.openSearch(); App._after = () => { const s = document.getElementById("searchInput"); if (s) s.focus(); }; return;
-      case "schedule": App.openSchedule(); return;
-      case "open-notifications": App.openNotifications(); return;
-      case "notif-open": App.notifOpen(d.id); return;
-      case "notif-read-all": App.notifReadAll(); return;
-      case "open-journal": DB.auditLog().then(l => { App._journal = l.sort((a, b) => (a.ts < b.ts ? 1 : -1)); App.route("journal"); }); return;
-      case "backup-export": App.backupExport(); return;
-      case "backup-import": { const el = document.getElementById("backupInput"); if (el) el.click(); return; }
-      case "task-open": App.openVioFrom(d.audit, d.vio); return;
-      case "tasks-filter-toggle": App.taskFilterOpen = !App.taskFilterOpen; App.render(); return;
-      case "tasks-reset": App.taskFilter = { restaurant: "", dept: "", assignee: "", status: "", overdue: false }; App.render(); return;
-      case "wf-open-ctx": App.openVioFrom(d.audit, d.vio); return;
-      case "open-history-item": History.openItem(d.id); return;
-      case "del-audit": App.deleteAudit(d.id); return;
-      case "hist-filter-toggle": App.histFilterOpen = !App.histFilterOpen; App.render(); return;
-      case "hist-reset": App.resetHistFilter(); return;
-      case "hist-export": Reports.exportPeriod(); return;
-      // admin: users & roles
-      case "adm-user-new": App.admUserNew(); return;
-      case "adm-user-edit": App.admUserEdit(d.id); return;
-      case "staff": App.openStaff(); return;
-      case "adm-staff-new": App.admStaffNew(); return;
-      case "adm-staff-edit": App.admStaffEdit(d.id); return;
-      case "adm-user-save": App.admUserSave(); return;
-      case "adm-user-del": App.admUserDel(d.id); return;
-      case "adm-user-photo": { const el = document.getElementById("uPhotoInput"); if (el) el.click(); return; }
-      case "adm-user-photo-del": App.adm.uDraft.photo = null; App.render(); return;
-      case "adm-role-new": App.admRoleNew(); return;
-      case "adm-role-edit": App.admRoleEdit(d.id); return;
-      case "adm-role-save": App.admRoleSave(); return;
-      case "adm-role-del": App.admRoleDel(d.id); return;
-      // admin: geo & positions
-      case "geo-add": App.geoAdd(d.parent || null, d.type); return;
-      case "geo-del": App.geoDel(d.id); return;
-      case "concept-add": App.conceptAdd(); return;
-      case "concept-del": App.conceptDel(d.id); return;
-      case "dept-add": App.deptAdd(); return;
-      case "dept-del": App.deptDel(d.id, !!d.has); return;
-      case "pos-new": App.posNew(d.parent || null); return;
-      case "pos-edit": App.posEdit(d.id); return;
-      case "pos-save": App.posSave(); return;
-      case "pos-del": App.posDel(d.id); return;
-      case "open-constructor": App.openConstructor(); return;
-      case "ctr-dept": App.ctrLoad(d.id).then(() => App.render()); return;
-      case "ctr-cat-new": App.ctrCatNew(); return;
-      case "ctr-cat-edit": App.ctrCatEdit(d.id); return;
-      case "ctr-cat-save": App.ctrCatSave(); return;
-      case "ctr-cat-del": App.ctrCatDel(d.id); return;
-      case "ctr-cp-new": App.ctrCpNew(d.cat); return;
-      case "ctr-cp-edit": App.ctrCpEdit(d.id); return;
-      case "ctr-cp-save": App.ctrCpSave(); return;
-      case "ctr-cp-del": App.ctrCpDel(d.id); return;
-      case "cp-mode": App.ctr.cpDraft.severityMode = d.val; App.render(); return;
-      case "ctr-history": App.openCtrHistory(); return;
-      case "ctr-export": Reports.exportChecklist(App.ctr.deptId); return;
-      case "pol-list": App.route("policies"); return;
-      case "pol-edit": App.admPolicyEdit(d.id); return;
-      case "pol-save": App.admPolicySave(); return;
-      case "pol-mode": App.adm.pDraft.mode = d.val; App.render(); return;
-      // violation form
-      case "vform-cancel": App.route("audit_run"); return;
-      case "vform-severity": VForm.draft.severity = d.val; App.render(); return;
-      case "vform-add-photo": { const el = document.getElementById("photoInput"); if (el) el.click(); return; }
-      case "vform-remove-photo": VForm.draft.photos.splice(+d.idx, 1); VForm.draft.markers.splice(+d.idx, 1); App.render(); return;
-      case "vform-edit-photo": PhotoEdit.open(+d.idx); return;
-      case "vform-voice": App.toggleVoice(); return;
-      case "vform-save": VForm.save(false); return;
-      case "vform-save-add": VForm.save(true); return;
-      // workflow (corrective / dispute)
-      case "wf-open": Workflow.open(Audit.active.id, d.id); return;
-      case "wf-add-photo": { const el = document.getElementById("wfPhotoInput"); if (el) el.click(); return; }
-      case "wf-photo-del": Workflow.ctx.composerPhotos.splice(+d.idx, 1); App.render(); return;
-      case "wf-fix": Workflow.submitFix(Workflow.ctx.wfText || (document.getElementById("wfText") || {}).value || ""); return;
-      case "wf-dispute": Workflow.raiseDispute(Workflow.ctx.wfText || (document.getElementById("wfText") || {}).value || ""); return;
-      case "wf-resolve": Workflow.resolve(); return;
-      case "wf-reject": Workflow.rejectFix(); return;
-      case "wf-vote-approve": Workflow.voteDispute(true, ""); return;
-      case "wf-vote-reject": Workflow.voteDispute(false, ""); return;
-      case "wf-set-score": Workflow.setScore(); return;
-      // photo editor
-      case "pe-tool": PhotoEdit.tool = d.val; App.render(); return;
-      case "pe-undo": PhotoEdit.undo(); return;
-      case "pe-save": PhotoEdit.save(); return;
-      case "pe-cancel": App.route("violation"); return;
-    }
-    if (d.route) App.route(d.route);
+  tile(route, icon, title, sub, press) {
+    return `<button data-route="${route}" class="tnk-press ${press ? "tnk-tile" : ""} p-4 rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left flex flex-col gap-3">
+      <div class="w-10 h-10 grid place-items-center rounded-2xl bg-brand/10 text-brand">${UI.icon(icon, "w-6 h-6")}</div>
+      <div><div class="font-bold text-[15px] leading-tight">${title}</div><div class="text-xs text-slate-500 mt-0.5">${sub}</div></div>
+    </button>`;
   },
 
-  _onChange(e) {
-    const el = e.target; const d = el.dataset || {};
-    if (el.id === "photoInput") { App.handlePhotos(el.files); return; }
-    if (el.id === "uPhotoInput") { App.admUserPhoto(el.files); return; }
-    if (el.id === "wfPhotoInput") { App.handleWfPhotos(el.files); return; }
-    if (el.id === "backupInput") { App.backupImport(el.files[0]); return; }
-    if (d.field === "sched-days") { App.schedSet(el.dataset.id, el.value); return; }
-    if (d.field === "setup-restaurant") { App.setup.restaurantId = el.value; return; }
-    if (d.field === "rest-concept") { App.setRestaurantConcept(el.dataset.id, el.value).then(() => App.render()); return; }
-    if (d.field && d.field.indexOf("hf-") === 0) {
-      const map = { "hf-from": "from", "hf-to": "to", "hf-auditor": "auditorId", "hf-restaurant": "restaurantId", "hf-dept": "deptId", "hf-assignee": "assignee" };
-      App.histFilter[map[d.field]] = el.value; App.applyHistFilter(true); return;
-    }
-    if (d.field && d.field.indexOf("tf-") === 0) {
-      const map = { "tf-restaurant": "restaurant", "tf-dept": "dept", "tf-assignee": "assignee", "tf-status": "status" };
-      if (d.field === "tf-overdue") App.taskFilter.overdue = el.checked; else App.taskFilter[map[d.field]] = el.value;
-      App.render(); return;
-    }
-    if (d.field === "penalty")  { VForm.setPenalty(el.value); App.render(); return; }
-    if (d.field === "assignee") { VForm.draft.assigneeRole = el.value; return; }
-    if (d.field === "vdeadline") { VForm.draft.deadline = el.value; return; }
-    if (d.field === "u-role") {
-      const set = new Set(App.adm.uDraft.roleIds || []);
-      el.checked ? set.add(el.value) : set.delete(el.value);
-      App.adm.uDraft.roleIds = Array.from(set); return;
-    }
-    if (d.field === "u-active") { App.adm.uDraft.active = el.checked; return; }
-    if (d.field === "share-user") { App.toggleShareUser(el.value, el.checked); return; }
-    if (d.field === "ack-user") { App.ackPick = el.value; return; }
-    if (d.field === "u-positionId") {
-      const p = App._positions.find(x => x.id === el.value);
-      App.adm.uDraft.positionId = el.value || null;
-      App.adm.uDraft.position = p ? p.title : "";
-      App.applyPositionDefaults(); App.render(); return;
-    }
-    if (d.field === "u-perm") { App.toggleUserPerm(el.value, el.checked); return; }
-    if (d.field === "u-scope") {
-      const set = new Set(App.adm.uDraft.scope || []);
-      el.checked ? set.add(el.value) : set.delete(el.value);
-      App.adm.uDraft.scope = Array.from(set); return;
-    }
-    if (d.field === "u-concept") {
-      const set = new Set(App.adm.uDraft.conceptIds || []);
-      el.checked ? set.add(el.value) : set.delete(el.value);
-      App.adm.uDraft.conceptIds = Array.from(set); return;
-    }
-    if (d.field === "u-dept") {
-      const set = new Set(App.adm.uDraft.deptIds || []);
-      el.checked ? set.add(el.value) : set.delete(el.value);
-      App.adm.uDraft.deptIds = Array.from(set); return;
-    }
-    if (d.field === "r-perm") {
-      const r = App.adm.rDraft;
-      let set = new Set((r.permissions || []).filter(p => p !== "*"));
-      el.checked ? set.add(el.value) : set.delete(el.value);
-      r.permissions = Array.from(set); return;
-    }
-    if (d.field === "pos-role") {
-      const set = new Set(App.adm.posDraft.roleIds || []);
-      el.checked ? set.add(el.value) : set.delete(el.value);
-      App.adm.posDraft.roleIds = Array.from(set); return;
-    }
-    if (d.field === "pol-approver") { App._polApprover(el.value, el.checked); return; }
-    if (d.field === "pol-override") { App._polField(el.dataset.uid, "canOverride", el.checked); return; }
-    if (d.field === "pol-threshold") { App.adm.pDraft.threshold = Number(el.value); App.render(); return; }
-    if (d.field === "cat-weight") { App.ctr.catDraft.weight = Number(el.value); App.render(); return; }
-    if (d.field === "cp-fixed") { App.ctr.cpDraft.fixedPenalty = Number(el.value); App.render(); return; }
-  },
-  _onInput(e) {
-    const el = e.target; const d = el.dataset || {};
-    if (d.field === "comment") { VForm.draft.comment = el.value; return; }
-    if (d.field === "wf-text") { Workflow.ctx.wfText = el.value; return; }
-    if (d.field === "auth-login") { Auth.loginVal = el.value; return; }
-    if (d.field === "user-search") { App.adm.userQuery = el.value; App._after = () => { const s = document.getElementById("userSearch"); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }; App.render(); return; }
-    if (d.field === "staff-search") { App.adm.staffQuery = el.value; App._after = () => { const s = document.getElementById("staffSearch"); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }; App.render(); return; }
-    if (d.field === "search-q") { App.searchQuery = el.value; App.doSearch(el.value).then(() => { App._after = () => { const s = document.getElementById("searchInput"); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }; App.render(); }); return; }
-    if (d.field === "u-name")     { App.adm.uDraft.name = el.value; return; }
-    if (d.field === "u-login")    { App.adm.uDraft.login = el.value; return; }
-    if (d.field === "u-position") { App.adm.uDraft.position = el.value; return; }
-    if (d.field === "u-pin")      { el.value = el.value.replace(/\D/g, "").slice(0, 6); App.adm.uDraft.pin = el.value; return; }
-    if (d.field === "r-name")     { App.adm.rDraft.name = el.value; return; }
-    if (d.field === "pos-title")  { App.adm.posDraft.title = el.value; return; }
-    if (d.field === "cat-name")   { App.ctr.catDraft.name = el.value; return; }
-    if (d.field === "cp-index")   { App.ctr.cpDraft.index = el.value; return; }
-    if (d.field === "cp-object")  { App.ctr.cpDraft.object = el.value; return; }
-    if (d.field === "cp-criterion") { App.ctr.cpDraft.criterion = el.value; return; }
-    if (d.field === "cp-req")     { App.ctr.cpDraft.requirement = el.value; return; }
-    if (d.field === "pol-weight") { App._polField(el.dataset.uid, "weight", Math.max(1, Number(el.value) || 1)); return; }
+  can(perm) {
+    if (!App.user) return false;
+    const p = App.effectivePerms(App.user);
+    return p.has("*") || p.has(perm);
   },
 
-  async handlePhotos(files) {
-    for (const f of Array.from(files)) {
-      try { const dataUrl = await Media.compress(f); VForm.draft.photos.push(dataUrl); VForm.draft.markers.push([]); }
-      catch (err) { /* skip unreadable file */ }
-    }
-    App.render();
-  },
-  async handleWfPhotos(files) {
-    Workflow.ctx.composerPhotos = Workflow.ctx.composerPhotos || [];
-    for (const f of Array.from(files)) {
-      try { Workflow.ctx.composerPhotos.push(await Media.compress(f, 1024, 0.7)); } catch (e) {}
-    }
-    App.render();
+  isAdmin() { return App.can("*"); },
+
+  userRoleNames(u) {
+    return (App._roles || []).filter(r => (u.roleIds || []).includes(r.id)).map(r => r.name).join(", ") || "Пользователь";
   },
 
-  toggleVoice() {
-    if (!Voice.supported()) { alert("Голосовой ввод не поддерживается этим браузером."); return; }
-    const ok = Voice.toggle(
-      (text) => { VForm.draft.comment = text; const ta = document.getElementById("vComment"); if (ta) ta.value = text; },
-      () => App.render()
-    );
-    App.render();
-    return ok;
-  },
-
-  async openAuditSetup() {
-    if (!App.can("audit.conduct")) { App.route("home"); return; }
-    const deps = await DB.departments();
-    for (const dep of deps) dep._count = (await DB.categories(dep.id)).length;
-    const audits = await DB.audits();
-    App.setup.departments = deps;
-    App.setup.resumable = audits
-      .filter(a => a.status === AUDIT_STATUS.IN_PROGRESS || a.status === AUDIT_STATUS.PAUSED)
-      .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
-    App.setup.scope = "single"; App.setup.selDept = null;
-    // Restaurants available to this auditor (concept + geo axes; empty = all)
-    App._geo = await DB.geoNodes(); App._concepts = await DB.concepts();
-    const rests = App.myRestaurants();
-    App.setup.restaurants = rests;
-    App.setup.restaurantId = rests.length === 1 ? rests[0].id : "";
-    App.route("audit_setup");
-  },
-  doStartAudit() {
-    const s = App.setup;
-    let deptIds;
-    if (s.scope === "all") deptIds = s.departments.filter(d => d._count > 0).map(d => d.id);
-    else deptIds = s.selDept ? [s.selDept] : [];
-    if (!deptIds.length) { alert("Выберите подразделение с чек-листом."); return; }
-    if ((s.restaurants || []).length && !s.restaurantId) { alert("Выберите ресторан."); return; }
-    Audit.start(s.scope, deptIds);
-  },
-
-  hist: { audits: [], top: [], trend: [], total: 0 },
-  histRaw: { audits: [], vios: [], cpMap: {} },
-  histFilter: { from: "", to: "", auditorId: "", restaurantId: "", deptId: "", assignee: "" },
-
-  async openHistory() {
-    let audits = (await DB.audits())
-      .filter(a => a.status === AUDIT_STATUS.COMPLETED || a.status === AUDIT_STATUS.ABORTED)
-      .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
-    audits = App.visibleAudits(audits); // viewAll / scope-subtree+own / own+shared
-    const idset = new Set(audits.map(a => a.id));
-    const allVios = (await IDB.getAll("audit_violations")).filter(v => idset.has(v.auditId));
-    const cpMap = {}; (await IDB.getAll("checklist_structure")).forEach(c => cpMap[c.id] = c);
-    App.histRaw = { audits, vios: allVios, cpMap };
-    App.histFilter = { from: "", to: "", auditorId: "", restaurantId: "", deptId: "", assignee: "" };
-    App.applyHistFilter(false);
-    App.route("history");
-  },
-
-  filteredHistory() {
-    const f = App.histFilter;
-    const fromT = f.from ? new Date(f.from + "T00:00:00").getTime() : -Infinity;
-    const toT   = f.to ? new Date(f.to + "T23:59:59").getTime() : Infinity;
-    let audits = App.histRaw.audits.filter(a => {
-      const t = new Date(a.startedAt).getTime();
-      if (t < fromT || t > toT) return false;
-      if (f.auditorId && a.auditorId !== f.auditorId) return false;
-      if (f.restaurantId && a.restaurantId !== f.restaurantId) return false;
-      if (f.deptId && !(a.deptIds || []).includes(f.deptId)) return false;
-      return true;
-    });
-    let vios = App.histRaw.vios;
-    if (f.deptId) vios = vios.filter(v => v.deptId === f.deptId);
-    if (f.assignee) {
-      vios = vios.filter(v => v.assigneeRole === f.assignee);
-      const withAssignee = new Set(vios.map(v => v.auditId));
-      audits = audits.filter(a => withAssignee.has(a.id));
-    }
-    const auditIds = new Set(audits.map(a => a.id));
-    vios = vios.filter(v => auditIds.has(v.auditId));
-    return { audits, vios };
-  },
-  applyHistFilter(rerender) {
-    const { audits, vios } = App.filteredHistory();
-    const cpMap = App.histRaw.cpMap;
-    const counts = {};
-    vios.forEach(v => { const o = (cpMap[v.checkpointId] || {}).object || "—"; counts[o] = (counts[o] || 0) + 1; });
-    const top = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => ({ name, count }));
-    const completed = audits.filter(a => a.status === AUDIT_STATUS.COMPLETED);
-    const trend = completed.slice(0, 12).reverse()
-      .map(a => ({ date: new Date(a.startedAt).toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" }), score: Math.round(a.finalScore == null ? 100 : a.finalScore) }));
-    const avg = completed.length ? Math.round(completed.reduce((s, a) => s + (a.finalScore == null ? 100 : a.finalScore), 0) / completed.length) : null;
-    App.hist = { audits, top, trend, total: vios.length, avg, vios };
-    if (rerender) App.render();
-  },
-  histActiveFilters() {
-    const f = App.histFilter;
-    return [f.from, f.to, f.auditorId, f.restaurantId, f.deptId, f.assignee].filter(Boolean).length;
-  },
-  resetHistFilter() { App.histFilter = { from: "", to: "", auditorId: "", restaurantId: "", deptId: "", assignee: "" }; App.applyHistFilter(true); },
-
-  // Multi-axis scope check: concept + geo(subtree) + department. Empty axis = no restriction.
-  conceptOfRestaurant(restId) { const r = App._geo.find(n => n.id === restId); return r ? (r.conceptId || null) : null; },
-  inScope(audit) {
-    const u = App.user || {};
-    const concepts = u.conceptIds || [], geo = u.scope || [], depts = u.deptIds || [];
-    if (concepts.length) { const cid = App.conceptOfRestaurant(audit.restaurantId); if (!cid || !concepts.includes(cid)) return false; }
-    if (geo.length) { const allowed = Geo.restaurantsUnder(App._geo, geo); if (!(audit.restaurantId && allowed.has(audit.restaurantId))) return false; }
-    if (depts.length) { if (!(audit.deptIds || []).some(x => depts.includes(x))) return false; }
-    return true;
-  },
-  // Restaurants the current user may see/audit (concept + geo axes). Empty scope = all.
-  myRestaurants() {
-    let rests = App._geo.filter(n => n.type === "restaurant");
-    const u = App.user || {};
-    if ((u.conceptIds || []).length) rests = rests.filter(r => (u.conceptIds).includes(r.conceptId));
-    if ((u.scope || []).length) { const allowed = Geo.restaurantsUnder(App._geo, u.scope); rests = rests.filter(r => allowed.has(r.id)); }
-    return rests;
-  },
-  _sharedWith(a) { return (App._access || []).some(g => g.auditId === a.id && g.userId === App.user.id); },
-  // Shared scope filter used by History + Dashboard
-  visibleAudits(audits) {
-    const perms = App.myPerms();
-    if (perms.has("*") || perms.has("audit.viewAll")) return audits;
-    if (perms.has("audit.viewScope")) {
-      return audits.filter(a => a.auditorId === App.user.id || App.inScope(a) || App._sharedWith(a));
-    }
-    return audits.filter(a => a.auditorId === App.user.id || App._sharedWith(a));
-  },
-
-  dash: { avg: null, count: 0, resolveQueue: [], voteQueue: [], attention: [], recent: [] },
-  async openDashboard() {
-    let audits = (await DB.audits()).filter(a => a.status === AUDIT_STATUS.COMPLETED);
-    audits = App.visibleAudits(audits).sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
-    const byId = {}; audits.forEach(a => byId[a.id] = a);
-    const idset = new Set(audits.map(a => a.id));
-    const vios = (await IDB.getAll("audit_violations")).filter(v => idset.has(v.auditId));
-    const cpMap = {}; (await IDB.getAll("checklist_structure")).forEach(c => cpMap[c.id] = c);
-    const resolveQueue = [], voteQueue = [];
-    vios.forEach(v => {
-      const a = byId[v.auditId]; if (!a) return;
-      if (v.status === VIO_STATUS.FIX_SUBMITTED && Workflow.canResolve(a)) resolveQueue.push({ v, a, cp: cpMap[v.checkpointId] || {} });
-      if (v.status === VIO_STATUS.DISPUTED && Workflow.isApprover(a) && !((v.dispute && v.dispute.votes) || []).some(x => x.userId === App.user.id)) voteQueue.push({ v, a, cp: cpMap[v.checkpointId] || {} });
-    });
-    const counts = {};
-    vios.filter(v => v.status !== VIO_STATUS.DISPUTE_UPHELD).forEach(v => { const o = (cpMap[v.checkpointId] || {}).object || "—"; counts[o] = (counts[o] || 0) + 1; });
-    const attention = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name, count]) => ({ name, count }));
-    const avg = audits.length ? Math.round(audits.reduce((s, a) => s + (a.finalScore == null ? 100 : a.finalScore), 0) / audits.length) : null;
-    App.dash = { avg, count: audits.length, resolveQueue, voteQueue, attention, recent: audits.slice(0, 5) };
-    App.route("dashboard");
-  },
-  async openVioFrom(auditId, vioId) {
-    await History.openItem(auditId); // loads Audit context
-    Workflow.open(auditId, vioId);
-  },
-
-  /* ---- Tasks (corrective actions with deadlines / overdue / repeat) ---- */
-  taskRaw: [],
-  taskFilter: { restaurant: "", dept: "", assignee: "", status: "", overdue: false },
-  OPEN_STATES: ["open", "fix_submitted", "dispute_rejected"],
-  _objectOf(v, audit, cpMap) {
-    if (audit && audit.checklist && audit.checklist[v.deptId]) {
-      const c = (audit.checklist[v.deptId].checkpoints || []).find(x => x.id === v.checkpointId);
-      if (c) return c.object;
-    }
-    return (cpMap[v.checkpointId] || {}).object || "—";
-  },
-  async openTasks() {
-    let audits = (await DB.audits()).filter(a => a.status === AUDIT_STATUS.COMPLETED);
-    audits = App.visibleAudits(audits);
-    const byId = {}; audits.forEach(a => byId[a.id] = a);
-    const idset = new Set(audits.map(a => a.id));
-    const allVios = (await IDB.getAll("audit_violations")).filter(v => idset.has(v.auditId));
-    const cpMap = {}; (await IDB.getAll("checklist_structure")).forEach(c => cpMap[c.id] = c);
-    // repeat occurrences: same restaurant + object across audits
-    const occ = {};
-    allVios.forEach(v => { const a = byId[v.auditId]; const key = (a.restaurantId || "") + "|" + App._objectOf(v, a, cpMap); (occ[key] = occ[key] || new Set()).add(v.auditId); });
-    App.taskRaw = allVios.filter(v => App.OPEN_STATES.includes(v.status || "open")).map(v => {
-      const a = byId[v.auditId]; const obj = App._objectOf(v, a, cpMap);
-      return { v, a, object: obj, repeat: (occ[(a.restaurantId || "") + "|" + obj] || new Set()).size };
-    });
-    App.taskFilter = { restaurant: "", dept: "", assignee: "", status: "", overdue: false };
-    App.route("tasks");
-  },
-  _isOverdue(v) { return v.deadline && new Date(v.deadline + "T23:59:59").getTime() < Date.now(); },
-  filteredTasks() {
-    const f = App.taskFilter;
-    return App.taskRaw.filter(t => {
-      if (f.restaurant && t.a.restaurantId !== f.restaurant) return false;
-      if (f.dept && t.v.deptId !== f.dept) return false;
-      if (f.assignee && t.v.assigneeRole !== f.assignee) return false;
-      if (f.status && (t.v.status || "open") !== f.status) return false;
-      if (f.overdue && !App._isOverdue(t.v)) return false;
-      return true;
-    });
-  },
-  taskActiveFilters() { const f = App.taskFilter; return [f.restaurant, f.dept, f.assignee, f.status, f.overdue].filter(Boolean).length; },
-
-  /* ---- Acknowledgment (sign-off), delegable down the hierarchy ---- */
-  ackPick: "",
-  async _ackSave() { await DB.saveAudit(Audit.active); Sync.enqueue(Audit.active.id); if (App.user) App.render(); },
-  async ackRequest(userId) {
-    const u = App.users.find(x => x.id === userId); if (!u) { alert("Выберите сотрудника."); return; }
-    Audit.active.acknowledgment = { assignedToId: u.id, assignedToName: u.name, status: "pending", requestedById: App.user.id, requestedByName: App.user.name, ts: new Date().toISOString() };
-    App.notify(u.id, "Отчёт направлен вам на ознакомление · " + (Audit.active.restaurant || ""), { type: "audit", auditId: Audit.active.id });
-    App.ackPick = ""; await App._ackSave();
-  },
-  async ackDelegate(userId) {
-    const u = App.users.find(x => x.id === userId); if (!u) { alert("Выберите сотрудника."); return; }
-    const a = Audit.active.acknowledgment || {};
-    a.assignedToId = u.id; a.assignedToName = u.name; a.status = "pending"; a.delegatedById = App.user.id; a.delegatedByName = App.user.name; a.ts = new Date().toISOString();
-    Audit.active.acknowledgment = a; App.notify(u.id, "Вам передан отчёт на ознакомление · " + (Audit.active.restaurant || ""), { type: "audit", auditId: Audit.active.id }); App.ackPick = ""; await App._ackSave();
-  },
-  async ackConfirm() {
-    const a = Audit.active.acknowledgment || {};
-    a.status = "done"; a.confirmedById = App.user.id; a.confirmedByName = App.user.name; a.confirmedTs = new Date().toISOString();
-    Audit.active.acknowledgment = a; await App._ackSave();
-  },
-
-  /* ===================== D5: audit log, notifications, backup, schedule, search ===================== */
-  async log(action, detail) {
-    try { await DB.logAction({ id: "log_" + Date.now() + "_" + Math.random().toString(36).slice(2, 5), ts: new Date().toISOString(), actor: App.user ? App.user.name : "система", action, detail: detail || "" }); } catch (e) {}
-  },
-  async notify(userId, text, link) {
-    if (!userId || (App.user && userId === App.user.id)) return; // don't notify self
-    try { await DB.notifyPut({ id: "ntf_" + Date.now() + "_" + Math.random().toString(36).slice(2, 5), userId, ts: new Date().toISOString(), text, link: link || null, read: false }); } catch (e) {}
-  },
-  async refreshNotif() {
-    if (!App.user) { App._notifUnread = 0; return; }
-    const list = await DB.notifications(App.user.id);
-    App._notif = list.sort((a, b) => (a.ts < b.ts ? 1 : -1));
-    App._notifUnread = list.filter(n => !n.read).length;
-  },
-  async openNotifications() { await App.refreshNotif(); App.route("notifications"); },
-  async notifOpen(id) {
-    const n = (App._notif || []).find(x => x.id === id); if (!n) return;
-    if (!n.read) { n.read = true; await DB.notifyPut(n); }
-    if (n.link && n.link.type === "vio") return App.openVioFrom(n.link.auditId, n.link.vioId);
-    if (n.link && n.link.type === "audit") return History.openItem(n.link.auditId);
-    await App.refreshNotif(); App.render();
-  },
-  async notifReadAll() { for (const n of (App._notif || [])) if (!n.read) { n.read = true; await DB.notifyPut(n); } await App.refreshNotif(); App.render(); },
-
-  // Backup: full JSON export / import
-  async backupExport() {
-    const dump = { _meta: { app: "TanukiAudit", ts: new Date().toISOString(), dbVersion: APP_CONFIG.db.version } };
-    for (const name of Object.keys(DB_SCHEMA)) { try { dump[name] = await IDB.getAll(name); } catch (e) { dump[name] = []; } }
-    Reports._download("tanuki_backup_" + new Date().toISOString().slice(0, 10) + ".json", new Blob([JSON.stringify(dump)], { type: "application/json" }));
-    App.log("Резервная копия скачана");
-    localStorage.setItem("tanuki_lastBackup", Date.now().toString());
-  },
-  async backupImport(file) {
-    if (!file) return;
-    if (!confirm("Восстановить из копии? Текущие данные будут ЗАМЕНЕНЫ.")) return;
-    try {
-      const dump = JSON.parse(await file.text());
-      for (const name of Object.keys(DB_SCHEMA)) {
-        if (!Array.isArray(dump[name])) continue;
-        const os = IDB._db.transaction(name, "readwrite").objectStore(name);
-        await new Promise((res) => { const r = os.clear(); r.onsuccess = res; r.onerror = res; });
-        await IDB.bulkPut(name, dump[name]);
-      }
-      alert("Восстановлено. Приложение перезагрузится."); location.reload();
-    } catch (e) { alert("Не удалось прочитать файл копии."); }
-  },
-  // Auto daily internal snapshot timestamp (real file backup stays manual)
-  async autoBackupCheck() {
-    const last = Number(localStorage.getItem("tanuki_lastAutoBackup") || 0);
-    if (Date.now() - last < 24 * 3600 * 1000) return;
-    localStorage.setItem("tanuki_lastAutoBackup", Date.now().toString());
-    // push everything to Sheets queue is heavy; here we just log. Manual export = the real backup.
-    App.log("Авто-отметка резервного копирования (ежедневно)");
-  },
-
-  // Audit scheduling / coverage
-  async openSchedule() {
-    App._schedules = await DB.schedules();
-    const audits = (await DB.audits()).filter(a => a.status === AUDIT_STATUS.COMPLETED);
-    App._lastAudit = {};
-    audits.forEach(a => { if (!a.restaurantId) return; const t = new Date(a.startedAt).getTime(); if (!App._lastAudit[a.restaurantId] || t > App._lastAudit[a.restaurantId]) App._lastAudit[a.restaurantId] = t; });
-    App.route("schedule");
-  },
-  async schedSet(restaurantId, everyDays) {
-    everyDays = Math.max(0, Number(everyDays) || 0);
-    const ex = (App._schedules || []).find(s => s.restaurantId === restaurantId);
-    if (everyDays === 0) { if (ex) await DB.delSchedule(ex.id); }
-    else await DB.saveSchedule({ id: ex ? ex.id : "sch_" + restaurantId, restaurantId, everyDays });
-    App._schedules = await DB.schedules(); App.render();
-  },
-  schedOverdue(restaurantId) {
-    const s = (App._schedules || []).find(x => x.restaurantId === restaurantId); if (!s) return null;
-    const last = App._lastAudit[restaurantId];
-    const dueTs = (last || 0) + s.everyDays * 86400000;
-    return { everyDays: s.everyDays, last, overdue: Date.now() > dueTs, dueTs };
-  },
-
-  // Universal search
-  searchQuery: "",
-  openSearch() { App.searchQuery = ""; App.route("search"); },
-  async doSearch(q) {
-    q = (q || "").trim().toLowerCase();
-    const res = { audits: [], violations: [], users: [], places: [], depts: [] };
-    if (q.length < 2) { App._search = res; return; }
-    let audits = (await DB.audits());
-    audits = App.visibleAudits(audits);
-    const byId = {}; audits.forEach(a => byId[a.id] = a);
-    res.audits = audits.filter(a => (a.restaurant || "").toLowerCase().includes(q) || (a.auditorName || "").toLowerCase().includes(q)).slice(0, 20);
-    const cpMap = {}; (await IDB.getAll("checklist_structure")).forEach(c => cpMap[c.id] = c);
-    const idset = new Set(audits.map(a => a.id));
-    res.violations = (await IDB.getAll("audit_violations")).filter(v => idset.has(v.auditId) && ((v.comment || "").toLowerCase().includes(q) || App._objectOf(v, byId[v.auditId], cpMap).toLowerCase().includes(q)))
-      .slice(0, 20).map(v => ({ v, a: byId[v.auditId], object: App._objectOf(v, byId[v.auditId], cpMap) }));
-    if (App.isAdmin()) res.users = App.users.filter(u => (u.name || "").toLowerCase().includes(q) || (u.login || "").toLowerCase().includes(q) || (u.position || "").toLowerCase().includes(q)).slice(0, 20);
-    res.places = App._geo.filter(n => (n.name || "").toLowerCase().includes(q)).slice(0, 20);
-    res.depts = App._departments.filter(dp => (dp.name || "").toLowerCase().includes(q)).slice(0, 20);
-    App._search = res;
-  },
-
-  shr: { auditId: null, granted: [] },
-  openShare(auditId) {
-    const granted = (App._access || []).filter(g => g.auditId === auditId).map(g => g.userId);
-    App.shr = { auditId, granted };
-    App.route("share");
-  },
-  toggleShareUser(uid, on) {
-    const set = new Set(App.shr.granted);
-    on ? set.add(uid) : set.delete(uid);
-    App.shr.granted = Array.from(set);
-  },
-  async saveShare() {
-    const { auditId, granted } = App.shr;
-    const existing = (App._access || []).filter(g => g.auditId === auditId);
-    const grantedSet = new Set(granted);
-    // remove revoked
-    for (const g of existing) if (!grantedSet.has(g.userId)) await DB.delAccess(g.id);
-    // add new
-    const existSet = new Set(existing.map(g => g.userId));
-    for (const uid of granted) if (!existSet.has(uid)) { await DB.saveAccess({ id: "acc_" + auditId + "_" + uid, auditId, userId: uid, grantedBy: App.user.id, ts: new Date().toISOString() }); App.notify(uid, "Вам открыт доступ к отчёту", { type: "audit", auditId }); }
-    App._access = await DB.access();
-    App.route("audit_done");
-  },
-
-  async deleteAudit(id) {
-    if (!App.can("audit.delete")) return;
-    if (!confirm("Удалить аудит безвозвратно? Отчёт и все нарушения будут удалены.")) return;
-    const vios = await DB.violations(id);
-    for (const v of vios) await IDB.del("audit_violations", v.id);
-    await IDB.del("audits_history", id);
-    await Sync.dequeue(id);
-    await App.log("Удалён аудит", id);
-    await App.openHistory();
-  },
-
-  /* ---- admin: users & roles CRUD ---- */
-  adm: { uDraft: null, rDraft: null },
-  admUserNew() {
-    App.adm.uDraft = { id: "u_" + Date.now(), name: "", login: "", position: "", pin: "", roleIds: [], scope: [], conceptIds: [], deptIds: [], photo: null, active: true };
-    App.route("user_edit");
-  },
-  admUserEdit(id) {
-    const u = App.users.find(x => x.id === id); if (!u) return;
-    App.adm.uDraft = JSON.parse(JSON.stringify(u));
-    App.route("user_edit");
-  },
-  ADMIN_PERMS: ["*", "users.manage", "roles.manage", "geo.manage", "org.manage", "checklist.edit", "audit.delete", "audit.viewAll"],
-  async admUserSave() {
-    const d = App.adm.uDraft;
-    d.name = (d.name || "").trim(); d.login = (d.login || "").trim().toLowerCase(); d.position = (d.position || "").trim();
-    if (!d.name || !d.login) { alert("Заполните ФИО и логин."); return; }
-    if (!/^\d{4,6}$/.test(d.pin || "")) { alert("PIN — от 4 до 6 цифр."); return; }
-    if (App.users.some(u => u.id !== d.id && (u.login || "").toLowerCase() === d.login)) { alert("Такой логин уже занят."); return; }
-    if (!(d.roleIds || []).length) { alert("Выберите хотя бы одну роль."); return; }
-    // Limited managers (createLogin but not full users.manage): rank + no-escalation guards
-    if (!App.can("users.manage")) {
-      if (Workflow.rankOf(d.positionId) <= Workflow.rankOf(App.user.positionId)) { alert("Можно заводить только сотрудников ниже вашей должности."); return; }
-      const eff = App.effectivePerms(d);
-      if (App.ADMIN_PERMS.some(p => eff.has(p))) { alert("Вы не можете выдавать административные права."); return; }
-    }
-    const backTo = App.adm._staffMode ? "staff" : "settings";
-    await DB.saveUser(d);
-    App.users = await DB.users();
-    if (App.user && App.user.id === d.id) App.user = App.users.find(u => u.id === d.id);
-    App.adm._staffMode = false;
-    await App.log("Сохранён пользователь", d.name + " (@" + d.login + ")");
-    App.route(backTo);
-  },
-  /* ---- manager: staff (scoped, below-rank) ---- */
-  openStaff() {
-    if (!App.can("users.createLogin")) { App.route("home"); return; }
-    App.route("staff");
-  },
-  staffList() {
-    const myRank = Workflow.rankOf(App.user.positionId);
-    return App.users.filter(u => u.id !== App.user.id && Workflow.rankOf(u.positionId) > myRank);
-  },
-  admStaffNew() {
-    App.adm.uDraft = { id: "u_" + Date.now(), name: "", login: "", position: "", pin: "", roleIds: [], scope: (App.user.scope || []).slice(), conceptIds: (App.user.conceptIds || []).slice(), deptIds: (App.user.deptIds || []).slice(), photo: null, active: true };
-    App.adm._staffMode = true;
-    App.route("user_edit");
-  },
-  admStaffEdit(id) {
-    const u = App.users.find(x => x.id === id); if (!u) return;
-    App.adm.uDraft = JSON.parse(JSON.stringify(u));
-    App.adm._staffMode = true;
-    App.route("user_edit");
-  },
-  async admUserDel(id) {
-    if (App.user && id === App.user.id) return;
-    if (!confirm("Удалить пользователя? Его аудиты останутся в истории.")) return;
-    await DB.delUser(id);
-    App.users = await DB.users();
-    App.route("settings");
-  },
-  admRoleNew() {
-    App.adm.rDraft = { id: "role_" + Date.now(), name: "", system: false, permissions: [] };
-    App.route("role_edit");
-  },
-  admRoleEdit(id) {
-    const r = App._roles.find(x => x.id === id); if (!r) return;
-    App.adm.rDraft = JSON.parse(JSON.stringify(r));
-    App.route("role_edit");
-  },
-  async admRoleSave() {
-    const d = App.adm.rDraft;
-    d.name = (d.name || "").trim();
-    if (!d.name) { alert("Введите название роли."); return; }
-    if (!(d.permissions || []).length) { alert("Отметьте хотя бы одно право."); return; }
-    await DB.saveRole(d);
-    App._roles = await DB.roles();
-    App.route("settings");
-  },
-  async admRoleDel(id) {
-    if (App.users.some(u => (u.roleIds || []).includes(id))) return;
-    if (!confirm("Удалить роль?")) return;
-    await DB.delRole(id);
-    App._roles = await DB.roles();
-    App.route("settings");
-  },
-  async admUserPhoto(files) {
-    if (!files || !files[0]) return;
-    try { App.adm.uDraft.photo = await Media.compress(files[0], 256, 0.75); App.render(); }
-    catch (e) { alert("Не удалось загрузить фото."); }
-  },
-  // Toggle an individual permission relative to the user's role baseline
-  toggleUserPerm(perm, want) {
-    const d = App.adm.uDraft;
-    d.permAdd = d.permAdd || []; d.permRemove = d.permRemove || [];
-    const roleHas = App.rolePerms(d).has("*") || App.rolePerms(d).has(perm);
-    d.permAdd = d.permAdd.filter(p => p !== perm);
-    d.permRemove = d.permRemove.filter(p => p !== perm);
-    if (want && !roleHas) d.permAdd.push(perm);      // grant beyond role
-    if (!want && roleHas) d.permRemove.push(perm);   // revoke from role
-    App.render();
-  },
-  // When a position is chosen, inherit its default role(s) + scope (user can then tweak)
-  applyPositionDefaults() {
-    const d = App.adm.uDraft;
-    const p = App._positions.find(x => x.id === d.positionId);
-    if (!p) return;
-    if ((p.roleIds || []).length) d.roleIds = p.roleIds.slice();
-    if ((p.scope || []).length) d.scope = p.scope.slice();
-    if ((p.conceptIds || []).length) d.conceptIds = p.conceptIds.slice();
-    if ((p.deptIds || []).length) d.deptIds = p.deptIds.slice();
-  },
-
-  /* ---- admin: geo & positions CRUD ---- */
-  _geo: [], _positions: [], _orgRoles: [], _policies: [], _access: [], _concepts: [], _departments: [], _catCount: {}, histFilterOpen: false, taskFilterOpen: false,
-  _notif: [], _notifUnread: 0, _search: null, _schedules: [], _lastAudit: {}, _journal: [],
-  async geoAdd(parentId, type) {
-    const name = (prompt("Название (" + Geo.TYPES[type] + "):") || "").trim();
-    if (!name) return;
-    await DB.saveGeo({ id: "geo_" + Date.now(), type, name, parentId: parentId || null });
-    App._geo = await DB.geoNodes(); App.render();
-  },
-  async geoDel(id) {
-    if (Geo.children(App._geo, id).length) { alert("Сначала удалите вложенные элементы."); return; }
-    if (App.users.some(u => (u.scope || []).includes(id))) { alert("Элемент используется в доступах пользователей."); return; }
-    if (!confirm("Удалить элемент географии?")) return;
-    await DB.delGeo(id); App._geo = await DB.geoNodes(); App.render();
-  },
-  posNew(parentId) {
-    App.adm.posDraft = { id: "pos_" + Date.now(), title: "", parentId: parentId || null, roleIds: [], scope: [], conceptIds: [], deptIds: [] };
-    App.route("position_edit");
-  },
-  posEdit(id) {
-    const p = App._positions.find(x => x.id === id); if (!p) return;
-    App.adm.posDraft = JSON.parse(JSON.stringify(p));
-    App.route("position_edit");
-  },
-  async posSave() {
-    const d = App.adm.posDraft; d.title = (d.title || "").trim();
-    if (!d.title) { alert("Введите название должности."); return; }
-    await DB.savePosition(d);
-    App._positions = await DB.positions();
-    App.route("positions");
-  },
-  async posDel(id) {
-    if (App._positions.some(p => p.parentId === id)) { alert("Сначала удалите подчинённые должности."); return; }
-    if (App.users.some(u => u.positionId === id)) { alert("Должность назначена пользователям."); return; }
-    if (!confirm("Удалить должность?")) return;
-    await DB.delPosition(id); App._positions = await DB.positions(); App.render();
-  },
-
-  /* ---- admin: concepts (brands) ---- */
-  async conceptAdd() {
-    const name = (prompt("Название концепции (бренда):") || "").trim();
-    if (!name) return;
-    await DB.saveConcept({ id: "cpt_" + Date.now(), name, order: (App._concepts || []).length + 1 });
-    App._concepts = await DB.concepts(); App.render();
-  },
-  async conceptDel(id) {
-    if (App._geo.some(n => n.conceptId === id)) { alert("К концепции привязаны рестораны — сначала отвяжите."); return; }
-    if (App.users.some(u => (u.conceptIds || []).includes(id))) { alert("Концепция используется в доступах пользователей."); return; }
-    if (!confirm("Удалить концепцию?")) return;
-    await DB.delConcept(id); App._concepts = await DB.concepts(); App.render();
-  },
-  async setRestaurantConcept(restId, conceptId) {
-    const n = App._geo.find(x => x.id === restId); if (!n) return;
-    n.conceptId = conceptId || null; await DB.saveGeo(n);
-    App._geo = await DB.geoNodes();
-  },
-
-  /* ---- admin: departments ---- */
-  async deptAdd() {
-    const name = (prompt("Название подразделения:") || "").trim();
-    if (!name) return;
-    const deps = await DB.departments();
-    await DB.saveDept({ id: "dept_" + Date.now(), name, order: deps.length + 1 });
-    App.render();
-  },
-  async deptDel(id, hasContent) {
-    if (hasContent) { alert("У подразделения есть чек-лист. Сначала очистите его в конструкторе."); return; }
-    const audits = await DB.audits();
-    if (audits.some(a => (a.deptIds || []).includes(id))) { alert("По подразделению уже есть аудиты — удаление запрещено."); return; }
-    if (!confirm("Удалить подразделение?")) return;
-    await DB.delDept(id); App.render();
-  },
-
-  /* ---- constructor: checklist editor ---- */
-  ctr: { deptId: null, cats: [], checks: [], catDraft: null, cpDraft: null },
-  async openConstructor() {
-    if (!App.can("checklist.edit")) { App.route("home"); return; }
-    App._departments = await DB.departments();
-    const dep = (App.ctr.deptId && App._departments.some(d => d.id === App.ctr.deptId)) ? App.ctr.deptId : (App._departments[0] && App._departments[0].id);
-    if (dep) await App.ctrLoad(dep);
-    App.route("constructor");
-  },
-  async ctrLoad(deptId) {
-    App.ctr.deptId = deptId;
-    App.ctr.cats = (await DB.categories(deptId)).sort((a, b) => Number(a.code) - Number(b.code));
-    App.ctr.checks = (await DB.checkpoints(deptId)).sort((a, b) => {
-      const pa = String(a.index).split(".").map(Number), pb = String(b.index).split(".").map(Number);
-      return (pa[0] - pb[0]) || ((pa[1] || 0) - (pb[1] || 0));
-    });
-  },
-  async ctrLog(action) {
-    await DB.logVersion({ id: "ver_" + Date.now() + "_" + Math.random().toString(36).slice(2, 5), deptId: App.ctr.deptId, ts: new Date().toISOString(), author: App.user.name, action });
-  },
-  async ctrRefreshCounts() {
-    App._catCount = {}; (await IDB.getAll("checklist_categories")).forEach(c => App._catCount[c.deptId] = (App._catCount[c.deptId] || 0) + 1);
-  },
-  // categories
-  ctrCatNew() {
-    const nextCode = String((App.ctr.cats.reduce((m, c) => Math.max(m, Number(c.code) || 0), 0)) + 1);
-    App.ctr.catDraft = { id: "cat_" + Date.now(), deptId: App.ctr.deptId, code: nextCode, name: "", weight: 20 };
-    App.route("category_edit");
-  },
-  ctrCatEdit(id) { const c = App.ctr.cats.find(x => x.id === id); if (!c) return; App.ctr.catDraft = JSON.parse(JSON.stringify(c)); App.route("category_edit"); },
-  async ctrCatSave() {
-    const d = App.ctr.catDraft; d.name = (d.name || "").trim(); d.weight = Math.max(0, Number(d.weight) || 0);
-    if (!d.name) { alert("Введите название категории."); return; }
-    await DB.saveCategory(d); await App.ctrLog("Категория сохранена: " + d.name);
-    await App.ctrRefreshCounts(); await App.ctrLoad(App.ctr.deptId); App.route("constructor");
-  },
-  async ctrCatDel(id) {
-    const c = App.ctr.cats.find(x => x.id === id);
-    if ((App.ctr.checks || []).some(cp => cp.categoryId === id)) { alert("В категории есть пункты — сначала удалите их."); return; }
-    if (!confirm("Удалить категорию?")) return;
-    await DB.delCategory(id); await App.ctrLog("Категория удалена: " + (c ? c.name : id));
-    await App.ctrRefreshCounts(); await App.ctrLoad(App.ctr.deptId); App.render();
-  },
-  // checkpoints
-  ctrCpNew(categoryId) {
-    App.ctr.cpDraft = { id: "chk_" + Date.now(), deptId: App.ctr.deptId, categoryId, index: "", object: "", criterion: "", requirement: "", severityMode: SEVMODE.RANGE, fixedPenalty: 5 };
-    App.route("checkpoint_edit");
-  },
-  ctrCpEdit(id) { const c = App.ctr.checks.find(x => x.id === id); if (!c) return; App.ctr.cpDraft = JSON.parse(JSON.stringify(c)); App.route("checkpoint_edit"); },
-  async ctrCpSave() {
-    const d = App.ctr.cpDraft; d.object = (d.object || "").trim();
-    if (!d.object) { alert("Введите объект контроля."); return; }
-    if (d.severityMode === SEVMODE.FIXED) d.fixedPenalty = Math.max(0, Math.min(100, Number(d.fixedPenalty) || 0));
-    await DB.saveCheckpoint(d); await App.ctrLog("Пункт сохранён: " + d.object);
-    await App.ctrLoad(App.ctr.deptId); App.route("constructor");
-  },
-  async ctrCpDel(id) {
-    const c = App.ctr.checks.find(x => x.id === id);
-    if (!confirm("Удалить пункт?")) return;
-    await DB.delCheckpoint(id); await App.ctrLog("Пункт удалён: " + (c ? c.object : id));
-    await App.ctrLoad(App.ctr.deptId); App.render();
-  },
-  async openCtrHistory() { App.ctr._versions = (await DB.versions(App.ctr.deptId)).sort((a, b) => (a.ts < b.ts ? 1 : -1)); App.route("constructor_history"); },
-
-  /* ---- admin: dispute policies ---- */
-  admPolicyEdit(id) {
-    const ex = (App._policies || []).find(p => p.id === id);
-    App.adm.pDraft = ex ? JSON.parse(JSON.stringify(ex)) : { id, mode: "unanimous", threshold: 60, approvers: [] };
-    App.route("policy_edit");
-  },
-  async admPolicySave() {
-    const d = App.adm.pDraft;
-    if ((d.approvers || []).length) await DB.savePolicy(d);
-    else await DB.delPolicy(d.id).catch(() => {}); // empty = remove policy
-    App._policies = await DB.policies();
-    App.route("policies");
-  },
-  _polApprover(uid, on) {
-    const d = App.adm.pDraft; d.approvers = d.approvers || [];
-    if (on) { if (!d.approvers.some(a => a.userId === uid)) d.approvers.push({ userId: uid, weight: 1, canOverride: false }); }
-    else d.approvers = d.approvers.filter(a => a.userId !== uid);
-    App.render();
-  },
-  _polField(uid, field, val) {
-    const a = (App.adm.pDraft.approvers || []).find(x => x.userId === uid);
-    if (a) a[field] = val;
-  },
-
-  // score -> tailwind text/bg color classes
-  scoreColor(p) {
-    if (p >= 90) return "text-emerald-600 dark:text-emerald-400";
-    if (p >= 75) return "text-amber-600 dark:text-amber-400";
-    return "text-brand";
-  },
-  fmtTime(iso) { const d = new Date(iso); return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" }); },
-  fmtDate(iso) { const d = new Date(iso); return d.toLocaleDateString("ru-RU") + " " + d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }); },
-
-  _roles: [],
-  // Permissions from a user's ROLES only (baseline, before individual overrides)
-  rolePerms(u) {
-    const set = new Set();
-    (App._roles || []).filter(r => (u.roleIds || []).includes(r.id))
-      .forEach(r => (r.permissions || []).forEach(p => set.add(p)));
-    return set;
-  },
-  // Effective permissions = roles + individual permAdd − permRemove ("*" expands if removals exist)
   effectivePerms(u) {
     const set = App.rolePerms(u);
     (u.permAdd || []).forEach(p => set.add(p));
-    if (set.has("*") && (u.permRemove || []).length) { set.delete("*"); ALL_PERMISSIONS.forEach(p => set.add(p)); }
     (u.permRemove || []).forEach(p => set.delete(p));
     return set;
   },
-  myPerms() { return App.user ? App.effectivePerms(App.user) : new Set(); },
-  can(perm) { const s = App.myPerms(); return s.has("*") || s.has(perm); },
-  isAdmin() { return App.can("users.manage") || App.can("roles.manage"); },
-  userRoleNames(u) {
-    return (App._roles || []).filter(r => (u.roleIds || []).includes(r.id)).map(r => r.name).join(", ") || "—";
+
+  rolePerms(u) {
+    const set = new Set();
+    (u.roleIds || []).forEach(rid => {
+      const r = (App._roles || []).find(x => x.id === rid);
+      if (r) (r.permissions || []).forEach(p => set.add(p));
+    });
+    return set;
   },
 
-  /* ---- shared UI ---- */
-  _splash(msg) {
-    return `<div class="min-h-dvh flex items-center justify-center">
-      <div class="text-center">${UI.logo("h-12 mx-auto mb-4")}
-        <div class="text-sm text-slate-500 dark:text-slate-400">${msg}</div></div></div>`;
+  scoreColor(p) { return p >= 90 ? "text-emerald-600" : p >= 75 ? "text-amber-600" : "text-brand"; },
+
+  fmtDate(iso) { return iso ? new Date(iso).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—"; },
+  fmtTime(iso) { return iso ? new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) : "—"; },
+
+  async refreshNotif() {
+    const all = await DB.notifications(App.user.id);
+    App._notif = all.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+    App._notifCount = App._notif.filter(n => !n.read).length;
   },
-  _setSync(ok) {
-    Sync.online = ok; App._syncOk = ok;
-    const b = document.getElementById("syncBadge");
-    if (!b) return;
-    b.className = "inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full " +
-      (ok ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
-          : "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400");
-    b.innerHTML = `<span class="w-1.5 h-1.5 rounded-full ${ok ? "bg-emerald-500" : "bg-slate-400"}"></span>${ok ? "Онлайн" : "Офлайн"}`;
+
+  async notify(uid, text, link) {
+    if (!uid) return;
+    const n = { id: "nt_" + Date.now() + "_" + Math.random().toString(36).slice(2, 5), userId: uid, ts: new Date().toISOString(), text, link, read: false };
+    await DB.notifyPut(n);
+    if (App.user && uid === App.user.id) { await App.refreshNotif(); App.render(); }
   },
-  _badge() {
-    const ok = App._syncOk;
-    const cls = ok === null ? "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400"
-      : ok ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
-           : "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400";
-    const dot = ok ? "bg-emerald-500" : "bg-slate-400";
-    const label = ok === null ? "…" : ok ? "Онлайн" : "Офлайн";
-    return `<span id="syncBadge" class="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full ${cls}"><span class="w-1.5 h-1.5 rounded-full ${dot}"></span>${label}</span>`;
+
+  log(action, detail) {
+    const l = { id: "log_" + Date.now(), ts: new Date().toISOString(), actor: App.user ? App.user.name : "Система", action, detail: detail || "" };
+    DB.logAction(l);
   },
-  appBar(title, opts) {
-    opts = opts || {};
-    const left = opts.back
-      ? `<button data-route="${opts.back}" aria-label="Назад" class="tnk-press -ml-1 w-10 h-10 grid place-items-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800">${UI.icon("back", "w-5 h-5")}</button>`
-      : UI.logo("h-7");
-    return `<header class="sticky top-0 z-20 bg-white/80 dark:bg-[#0B1120]/80 backdrop-blur-md border-b border-slate-200/70 dark:border-slate-800">
-      <div class="max-w-3xl mx-auto flex items-center gap-3 px-4 h-14">
-        ${left}
-        <h1 class="font-semibold text-[15px] flex-1 truncate ${opts.back ? "" : "sr-only"}">${title}</h1>
-        ${App._badge()}
-        ${App.user ? `<button data-action="open-notifications" aria-label="Уведомления" class="tnk-press relative w-10 h-10 grid place-items-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">${UI.icon("bell", "w-5 h-5")}${App._notifUnread ? `<span class="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 grid place-items-center rounded-full bg-brand text-white text-[10px] font-bold">${App._notifUnread > 9 ? "9+" : App._notifUnread}</span>` : ""}</button>` : ""}
-        <button data-action="theme" aria-label="Сменить тему" class="tnk-press w-10 h-10 grid place-items-center rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800">${UI.icon(Session.data.theme === "dark" ? "sun" : "moon", "w-5 h-5")}</button>
-      </div></header>`;
+
+  // --- Загрузка данных для экранов ---
+  async prepareRouteData(route) {
+    if (route === "audit_setup") {
+      const audits = await DB.audits();
+      App.setup.resumable = audits.filter(a => a.status === AUDIT_STATUS.PAUSED);
+      App.setup.restaurants = App._geo.filter(n => n.type === "restaurant");
+      App.setup.departments = App._departments.map(d => Object.assign({}, d, { _count: App._catCount[d.id] || 0 }));
+      if (!App.setup.selDept && App._departments.length) App.setup.selDept = App._departments[0].id;
+    }
+    if (route === "dashboard") {
+      const audits = await DB.audits();
+      const completed = audits.filter(a => a.status === AUDIT_STATUS.COMPLETED);
+      App.dash.count = completed.length;
+      App.dash.avg = completed.length ? Math.round(completed.reduce((s,a) => s + (a.finalScore||100), 0) / completed.length) : null;
+      App.dash.recent = completed.sort((a,b) => new Date(b.startedAt) - new Date(a.startedAt)).slice(0, 5);
+    }
+    if (route === "history") {
+      App.hist.audits = await DB.audits();
+      App.hist.total = App.hist.audits.length;
+    }
+    if (route === "tasks") {
+      const vios = await IDB.getAll("audit_violations");
+      App.taskRaw = vios.map(v => ({ v, a: {}, object: "Нарушение", repeat: 1 }));
+    }
+    if (route === "constructor") {
+      if (!App.ctr.deptId && App._departments.length) App.ctr.deptId = App._departments[0].id;
+      if (App.ctr.deptId) {
+        App.ctr.cats = await DB.categories(App.ctr.deptId);
+        App.ctr.checks = await DB.checkpoints(App.ctr.deptId);
+      }
+    }
   },
-  tile(target, icon, label, sub, asAction) {
-    const attr = asAction ? `data-action="${target}"` : `data-route="${target}"`;
-    return `<button ${attr} class="tnk-press tnk-tile group text-left p-5 rounded-3xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 hover:border-brand/40 dark:hover:border-brand/40 shadow-[0_1px_2px_rgba(15,23,42,.04)]">
-      <div class="w-11 h-11 grid place-items-center rounded-2xl bg-brand/10 text-brand mb-4">${UI.icon(icon, "w-6 h-6")}</div>
-      <div class="font-semibold text-[17px] tracking-tight">${label}</div>
-      <div class="text-[13px] leading-snug text-slate-500 dark:text-slate-400 mt-0.5">${sub}</div></button>`;
+
+  staffList() { return App.users.filter(u => u.active && u.id !== App.user.id); },
+  filteredTasks() { return App.taskRaw; },
+  taskActiveFilters() { return ""; },
+  histActiveFilters() { return ""; },
+  _isOverdue(vio) { return vio.deadline && new Date(vio.deadline) < new Date(); },
+  schedOverdue(rstId) { return null; },
+
+  // --- Бэкапы и Импорт ---
+  async exportBackup() {
+    if (!App.isAdmin()) return;
+    const dump = {};
+    for (const store of Object.keys(DB_SCHEMA)) dump[store] = await IDB.getAll(store);
+    const blob = new Blob([JSON.stringify(dump)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `tanuki_backup_${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
   },
+
+  async importBackup(file) {
+    if (!App.isAdmin() || !confirm("Внимание! Текущая база будет полностью удалена. Продолжить?")) return;
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const dump = JSON.parse(e.target.result);
+        App.el.innerHTML = App._splash("Восстановление бэкапа…");
+        for (const store of Object.keys(dump)) {
+          if (DB_SCHEMA[store] && dump[store]) {
+            const os = IDB._db.transaction(store, "readwrite").objectStore(store);
+            await new Promise(res => { const req = os.clear(); req.onsuccess = res; req.onerror = res; });
+            await IDB.bulkPut(store, dump[store]);
+          }
+        }
+        alert("Бэкап успешно восстановлен!"); location.reload();
+      } catch (err) { alert("Ошибка файла бэкапа."); location.reload(); }
+    };
+    reader.readAsText(file);
+  },
+
+  async importChecklist(file) {
+    if (!window.XLSX) { alert("Библиотека Excel не загружена (нужен интернет)."); return; }
+    if (!App.ctr.deptId) { alert("Выберите подразделение для импорта."); return; }
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const wb = window.XLSX.read(e.target.result, { type: 'binary' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const data = window.XLSX.utils.sheet_to_json(sheet);
+        
+        let cats = [], checks = [];
+        data.forEach((row, i) => {
+          let cat = cats.find(c => c.name === row["Категория"]);
+          if (!cat) {
+            cat = { id: "cat_" + Date.now() + "_" + i, deptId: App.ctr.deptId, name: row["Категория"], weight: Number(row["Вес %"]) || 0 };
+            cats.push(cat);
+          }
+          checks.push({
+            id: "chk_" + Date.now() + "_" + i, deptId: App.ctr.deptId, categoryId: cat.id,
+            index: row["Индекс"], object: row["Объект"], criterion: row["Критерий"], requirement: row["Требование"],
+            severityMode: SEVMODE.RANGE
+          });
+        });
+        
+        await IDB.bulkPut("checklist_categories", cats);
+        await IDB.bulkPut("checklist_structure", checks);
+        alert("Чек-лист успешно импортирован!");
+        await App.prepareRouteData("constructor");
+        App.render();
+      } catch (err) { alert("Неверный формат Excel. Убедитесь, что заголовки колонок совпадают с экспортированным шаблоном."); }
+    };
+    reader.readAsBinaryString(file);
+  },
+
   deptName(id) {
-    const src = (App.setup.departments && App.setup.departments.length) ? App.setup.departments : SEED.departments;
-    const d = src.find(x => x.id === id); return d ? d.name : id;
+    if (!id) return "—";
+    const src = (App._departments && App._departments.length) ? App._departments :
+                ((App.setup && App.setup.departments && App.setup.departments.length) ? App.setup.departments : SEED.departments);
+    const d = src.find(x => x.id === id);
+    return d ? d.name : id;
   },
+
   stub(title, note) {
     return App.appBar(title, { back: "home" }) + `<main class="max-w-3xl mx-auto px-4 py-6">
       <div class="px-6 py-14 rounded-3xl border border-dashed border-slate-300 dark:border-slate-700 text-center">
@@ -2575,7 +2054,6 @@ const App = {
         <div class="text-sm text-slate-500 dark:text-slate-400 mt-1">${note}</div></div></main>`;
   },
 
-  /* ---- screens ---- */
   screens: {
     login()  { return Auth.screen(); },
     home()   {
@@ -2616,7 +2094,7 @@ const App = {
           <button data-action="resume-audit" data-id="${a.id}" class="tnk-press w-full flex items-center gap-3 p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-left">
             <div class="w-9 h-9 grid place-items-center rounded-xl ${a.status === AUDIT_STATUS.PAUSED ? "bg-amber-500/10 text-amber-500" : "bg-brand/10 text-brand"}">${UI.icon(a.status === AUDIT_STATUS.PAUSED ? "pause" : "clipboard", "w-5 h-5")}</div>
             <div class="flex-1 min-w-0"><div class="font-medium text-sm truncate">${a.scope === "all" ? "Все подразделения" : App.deptName(a.deptIds[0])}</div>
-              <div class="text-xs text-slate-500">${App.fmtDate(a.startedAt)} · ${a.status === AUDIT_STATUS.PAUSED ? "на паузе" : "в процессе"}</div></div>
+              <div class="text-xs text-slate-500">${App.fmtDate(a.startedAt)} ·${a.status === AUDIT_STATUS.PAUSED ? "на паузе" : "в процессе"}</div></div>
             ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>`).join("")}</div></section>` : "";
       const scopeCard = (val, icon, title, sub) => `<button data-action="set-scope" data-val="${val}" class="tnk-press flex-1 p-4 rounded-2xl border text-left ${s.scope === val ? "border-brand bg-brand/5" : "border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900"}">
         <div class="w-9 h-9 grid place-items-center rounded-xl ${s.scope === val ? "bg-brand text-white" : "bg-slate-100 dark:bg-slate-800 text-slate-500"} mb-2">${UI.icon(icon, "w-5 h-5")}</div>
@@ -2653,7 +2131,7 @@ const App = {
       const chks = Audit.data.checkpoints[deptId] || [];
       const scores = Audit.recompute().scores;
       const tabs = a.deptIds.length > 1 ? `<div class="flex gap-2 overflow-x-auto pb-1 -mx-4 px-4">${a.deptIds.map(id => `
-        <button data-action="switch-dept" data-dept="${id}" class="tnk-press shrink-0 px-4 h-9 rounded-full text-sm font-medium border ${id === deptId ? "bg-brand text-white border-brand" : "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300"}">${App.deptName(id)} · ${Math.round(scores[id] ? scores[id].score : 100)}%</button>`).join("")}</div>` : "";
+        <button data-action="switch-dept" data-dept="${id}" class="tnk-press shrink-0 px-4 h-9 rounded-full text-sm font-medium border ${id === deptId ? "bg-brand text-white border-brand" : "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300"}">${App.deptName(id)} ·${Math.round(scores[id] ? scores[id].score : 100)}%</button>`).join("")}</div>` : "";
       const catBlocks = cats.map(cat => {
         const catChks = chks.filter(c => c.categoryId === cat.id);
         const catScore = scores[deptId] && scores[deptId].categories[cat.id] != null ? scores[deptId].categories[cat.id] : 100;
@@ -2721,7 +2199,7 @@ const App = {
         </div>
         <div><label class="block text-sm font-medium mb-2">Тип нарушения</label><div class="flex gap-2">${sevBtn(SEVERITY.CRITICAL, "Критично")}${sevBtn(SEVERITY.NON_CRITICAL, "Некритично")}</div></div>
         ${d.severityMode === SEVMODE.FIXED
-          ? `<div><label class="block text-sm font-medium mb-2">Штраф</label><div class="h-12 px-3 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm flex items-center text-slate-600 dark:text-slate-300">−${d.penaltyPercent}% · фиксированный${d.penaltyPercent >= 100 ? " (обнуляет категорию)" : ""}</div></div>`
+          ? `<div><label class="block text-sm font-medium mb-2">Штраф</label><div class="h-12 px-3 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm flex items-center text-slate-600 dark:text-slate-300">−${d.penaltyPercent}\% · фиксированный${d.penaltyPercent >= 100 ? " (обнуляет категорию)" : ""}</div></div>`
           : d.severityMode === SEVMODE.MANAGER
           ? `<div class="p-3 rounded-xl bg-violet-50 dark:bg-violet-500/5 border border-violet-200 dark:border-violet-500/20 text-sm text-slate-600 dark:text-slate-300">${UI.icon("shield", "w-4 h-4 inline mr-1 -mt-0.5")}Оценку в процентах поставит руководитель. Вы фиксируете факт нарушения.</div>`
           : `<div><label class="block text-sm font-medium mb-2" for="pen">Штраф</label>
@@ -2800,7 +2278,7 @@ const App = {
           const canRequest = a.auditorId === App.user.id || App.can("task.assign");
           let inner = "";
           if (!ack) inner = canRequest ? `<div class="text-xs text-slate-500 mb-2">Отправьте отчёт ответственному лицу для ознакомления.</div>${sel("ack-request")}` : `<div class="text-sm text-slate-500">Ознакомление не запрошено.</div>`;
-          else if (ack.status === "done") inner = `<div class="text-sm text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1.5">${UI.icon("check", "w-4 h-4")}Ознакомлен: ${Reports._esc(ack.confirmedByName)} · ${App.fmtDate(ack.confirmedTs)}</div>`;
+          else if (ack.status === "done") inner = `<div class="text-sm text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1.5">${UI.icon("check", "w-4 h-4")}Ознакомлен: ${Reports._esc(ack.confirmedByName)} ·${App.fmtDate(ack.confirmedTs)}</div>`;
           else if (ack.assignedToId === App.user.id) inner = `<div class="text-sm mb-2">Отчёт направлен вам на ознакомление.</div>
             <button data-action="ack-confirm" class="tnk-press w-full h-11 rounded-xl bg-emerald-600 text-white font-semibold text-sm mb-3">Подтвердить ознакомление</button>
             <div class="text-xs text-slate-500 mb-1">Или передать подчинённому:</div>${sel("ack-delegate")}`;
@@ -2862,6 +2340,10 @@ const App = {
         <div class="grid grid-cols-2 gap-3">
           <div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-center"><div class="text-3xl font-bold ${d.avg == null ? "text-slate-400" : App.scoreColor(d.avg)}">${d.avg == null ? "—" : d.avg + "%"}</div><div class="text-xs text-slate-500 mt-0.5">средняя оценка</div></div>
           <div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-center"><div class="text-3xl font-bold">${d.count}</div><div class="text-xs text-slate-500 mt-0.5">проверок</div></div>
+        </div>
+        <div class="flex gap-2">
+          <button data-action="export-excel" class="tnk-press flex-1 h-11 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium inline-flex items-center justify-center gap-2 text-slate-600 dark:text-slate-300">${UI.icon("download", "w-4 h-4")}Экспорт Excel</button>
+          <button data-action="export-pdf" class="tnk-press flex-1 h-11 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium inline-flex items-center justify-center gap-2 text-slate-600 dark:text-slate-300">${UI.icon("file", "w-4 h-4")}Экспорт PDF</button>
         </div>
         ${queue}${attention}${recent}
         ${App.can("audit.conduct") ? `<button data-action="new-audit" class="tnk-press w-full h-13 py-4 rounded-2xl bg-brand text-white font-semibold inline-flex items-center justify-center gap-2">${UI.icon("clipboard", "w-5 h-5")}Провести проверку</button>` : ""}
@@ -2964,20 +2446,17 @@ const App = {
       const cp = (Audit.data.checkpoints[v.deptId] || []).find(c => c.id === v.checkpointId) || {};
       const assignee = (App._orgRoles.find(r => r.id === v.assigneeRole) || {}).title;
       const photoStrip = (arr) => (arr && arr.length) ? `<div class="flex gap-2 flex-wrap mt-2">${arr.map(p => `<img src="${p}" class="w-24 h-24 object-cover rounded-lg border border-slate-200 dark:border-slate-700">`).join("")}</div>` : "";
-      // Finding (from violation itself)
       const findingBlock = `<div class="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
         <div class="flex items-center gap-2 mb-1"><span class="w-2 h-2 rounded-full ${v.severity === SEVERITY.CRITICAL ? "bg-brand" : "bg-slate-400"}"></span>
           <span class="text-xs font-semibold text-slate-500">Замечание · ${audit.auditorName || ""} · ${App.fmtTime(v.createdAt)}</span></div>
         ${v.comment ? `<div class="text-sm">${Reports._esc(v.comment)}</div>` : '<div class="text-sm text-slate-400">Без комментария</div>'}
         ${photoStrip(v.photos)}</div>`;
-      // Thread (fixes / disputes / decisions)
       const kindStyle = { fix: "border-l-4 border-amber-400", dispute: "border-l-4 border-violet-400", decision: "border-l-4 border-emerald-400" };
       const kindName = { fix: "Исправление", dispute: "Оспаривание", decision: "Решение" };
       const thread = (v.thread || []).filter(e => e.kind && e.kind !== "finding").map(e => `<div class="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 ${kindStyle[e.kind] || ""}">
         <div class="text-xs font-semibold text-slate-500 mb-1">${kindName[e.kind] || ""} · ${Reports._esc(e.name || "")}${e.role ? " (" + Reports._esc(e.role) + ")" : ""} · ${App.fmtTime(e.ts)}</div>
         ${e.text ? `<div class="text-sm">${Reports._esc(e.text)}</div>` : ""}${photoStrip(e.photos)}</div>`).join("");
 
-      // Action availability
       const canFix = [VIO_STATUS.OPEN, VIO_STATUS.FIX_SUBMITTED, VIO_STATUS.DISPUTE_REJECTED].includes(st);
       const canResolve = Workflow.canResolve(audit) && st === VIO_STATUS.FIX_SUBMITTED;
       const canDispute = App.can("dispute.raise") && [VIO_STATUS.OPEN, VIO_STATUS.FIX_SUBMITTED].includes(st) && !v.dispute;
@@ -3027,7 +2506,6 @@ const App = {
       const h = App.hist, f = App.histFilter, nf = App.histActiveFilters();
       const canDelete = App.can("audit.delete");
       const raw = App.histRaw.audits;
-      // Filter option sources (derived from visible audit set)
       const auditors = [...new Map(raw.map(a => [a.auditorId, a.auditorName])).entries()].map(([id, name]) => ({ id, name }));
       const rests = [...new Map(raw.filter(a => a.restaurantId).map(a => [a.restaurantId, a.restaurant])).entries()].map(([id, name]) => ({ id, name }));
       const depts = [...new Set(raw.flatMap(a => a.deptIds || []))].map(id => ({ id, name: App.deptName(id) }));
@@ -3126,12 +2604,14 @@ const App = {
             <div class="text-xs ${totalW === 100 ? "text-slate-500" : "text-amber-600 dark:text-amber-400"}">Сумма весов: ${totalW}%${totalW === 100 ? "" : " (обычно 100%)"}</div>
             <div class="flex gap-2">
               <button data-action="ctr-history" class="tnk-press text-[13px] text-slate-500 inline-flex items-center gap-1">${UI.icon("file", "w-4 h-4")}Версии</button>
+              <button data-action="ctr-import-btn" class="tnk-press text-[13px] text-emerald-600 font-medium inline-flex items-center gap-1">${UI.icon("download", "w-4 h-4")}Импорт (Excel)</button>
               <button data-action="ctr-export" class="tnk-press text-[13px] text-brand font-medium inline-flex items-center gap-1">${UI.icon("download", "w-4 h-4")}Экспорт</button>
             </div>
           </div>
           ${catBlocks || '<div class="text-center text-sm text-slate-500 py-8">В подразделении пока нет категорий.</div>'}
           <button data-action="ctr-cat-new" class="tnk-press w-full h-12 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 text-sm font-medium text-slate-500">+ Добавить категорию</button>
         ` : '<div class="text-center text-sm text-slate-500 py-8">Нет подразделений. Добавьте их в Настройки → Подразделения.</div>'}
+        <input id="checklistInput" type="file" accept=".xlsx, .xls" class="hidden">
       </main>`;
     },
 
@@ -3263,8 +2743,8 @@ const App = {
               <div class="flex-1"><div class="font-medium text-sm">Журнал действий</div><div class="text-xs text-slate-500">Кто что менял</div></div>
               ${UI.icon("chevron", "w-4 h-4 text-slate-400")}</button>
             <div class="flex gap-2">
-              <button data-action="backup-export" class="tnk-press flex-1 h-12 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm font-medium inline-flex items-center justify-center gap-2 text-slate-700 dark:text-slate-200">${UI.icon("download", "w-4 h-4")}Скачать бэкап</button>
-              <button data-action="backup-import" class="tnk-press flex-1 h-12 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm font-medium inline-flex items-center justify-center gap-2 text-slate-700 dark:text-slate-200">${UI.icon("save", "w-4 h-4")}Восстановить</button>
+              <button data-action="backup-export" class="tnk-press flex-1 h-12 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm font-medium inline-flex items-center justify-center gap-2 text-slate-700 dark:text-slate-200" ${!App.isAdmin() ? 'disabled' : ''}>${UI.icon("download", "w-4 h-4")}Скачать бэкап</button>
+              <button data-action="backup-import" class="tnk-press flex-1 h-12 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-sm font-medium inline-flex items-center justify-center gap-2 text-slate-700 dark:text-slate-200" ${!App.isAdmin() ? 'disabled' : ''}>${UI.icon("save", "w-4 h-4")}Восстановить</button>
             </div>
             <input id="backupInput" type="file" accept="application/json,.json" class="hidden">
           </div>
@@ -3546,7 +3026,7 @@ const App = {
         </div></footer>`;
     }
   }
-};
+}; 
 
 /* ===================== Auth (login -> welcome -> PIN 4-6) ===================== */
 const Auth = {
